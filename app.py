@@ -39,12 +39,20 @@ Unit No | Unit Size (SF) | Market Rent (Monthly) | Effective Rent (Monthly) | Le
 
 STANDARDIZATION RULES:
 1. One row per tenant. Combine all charge lines for the same unit into one row.
-2. Effective Rent = base rent + housing subsidy (rentsub) - employee discounts (empdisc) - move-in discounts (discnewm). Do NOT include petfee, parkfee, amentfee, or trash.
+2. Effective Rent = the base rent charge ONLY (the primary "rent" line item).
+   - ADD housing subsidy if present (charge codes: rentsub, hap, subsidy).
+   - SUBTRACT employee discounts (empdisc) and move-in discounts (discnewm) if present.
+   - IGNORE and DO NOT ADD any of the following to Effective Rent under any circumstances:
+     deposits (security deposit, resident deposit, other deposit, any column with "deposit" in the name),
+     utilities, water, electric, gas, trash, pest control,
+     pet fees (petfee), parking fees (parkfee), amenity fees (amentfee),
+     concessions, late fees, administrative fees, or any other ancillary charges.
+   - If you are unsure whether a charge belongs, leave it out. When in doubt, exclude it.
 3. If rents are annual, divide by 12. If rent/sf is given, multiply by unit size to get monthly rent.
 4. Normalize all dates to MM/DD/YYYY. If date is missing, use null.
 5. Vacant rows: include if market rent is shown. Set Effective Rent to null, Tenant Name to "VACANT".
 6. Admin/Model units: include them. Set Effective Rent to null. Tenant Name = "ADMIN" or "MODEL".
-7. Future/pending leases with no active charges: exclude.
+7. Future/pending leases with no active rent charges: exclude.
 8. Remove exact duplicate rows.
 9. Do NOT include subtotals, section headers, summary rows, or footers.
 10. Round all monetary values to 2 decimal places.
@@ -134,8 +142,8 @@ def standardize_rent_roll(df: pd.DataFrame) -> pd.DataFrame:
             result_df[date_col], errors="coerce"
         ).dt.strftime("%m/%d/%Y")
 
-    # Remove duplicates
-    result_df.drop_duplicates(subset=["Unit No", "Tenant Name"], inplace=True)
+    # Deduplicate on Unit No only — keeps current tenant, drops future/pending duplicates
+    result_df.drop_duplicates(subset=["Unit No"], keep="first", inplace=True)
     result_df.reset_index(drop=True, inplace=True)
 
     return result_df
@@ -223,7 +231,7 @@ if check_password():
 
             # --- Download ---
             output = io.BytesIO()
-            with pd.ExcelWriter(output, engine="openpyxl") as writer:
+            with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
                 standardized_df.to_excel(writer, index=False, sheet_name="Standardized Rent Roll")
             output.seek(0)
 
