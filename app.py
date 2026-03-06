@@ -1,216 +1,239 @@
 import streamlit as st
 import pandas as pd
 import io
-import os
-from anthropic import Anthropic
+import re
 import json
+from anthropic import Anthropic
 
 # --- Configuration ---
-CLAUDE_MODEL = "claude-sonnet-4-20250514" # Or other suitable Claude model
-CHUNK_SIZE = 100 # Number of rows per chunk for Claude processing
+CLAUDE_MODEL = "claude-sonnet-4-20250514"
+CHUNK_SIZE = 80  # rows per Claude call
 
-# --- Security: Simple Password Gate ---
+# --- Password Gate ---
 def check_password():
-    """Returns `True` if the user enters the correct password."""
-
     def password_entered():
-        """Checks whether a password entered by the user is correct."""
         if st.session_state["password"] == st.secrets["password"]:
             st.session_state["password_correct"] = True
-            del st.session_state["password"]  # Don\'t store password
+            del st.session_state["password"]
         else:
             st.session_state["password_correct"] = False
 
     if "password_correct" not in st.session_state:
-        # First run, show input for password.
-        st.text_input(
-            "Password", type="password", on_change=password_entered, key="password"
-        )
+        st.text_input("Password", type="password", on_change=password_entered, key="password")
         return False
     elif not st.session_state["password_correct"]:
-        # Password not correct, show input again
-        st.text_input(
-            "Password", type="password", on_change=password_entered, key="password"
-        )
-        st.error("😕 Password incorrect")
+        st.text_input("Password", type="password", on_change=password_entered, key="password")
+        st.error("Incorrect password.")
         return False
     else:
-        # Password correct.
         return True
 
 
-# --- Claude AI Processing Function ---
-def standardize_rent_roll_with_claude(df: pd.DataFrame) -> pd.DataFrame:
+# --- Claude Processing ---
+def call_claude(client, chunk_csv: str, chunk_num: int, total_chunks: int) -> list:
+    prompt = f"""
+You are an expert in multifamily real estate underwriting. Standardize the rent roll data below.
+
+REQUIRED OUTPUT COLUMNS:
+Unit No | Unit Size (SF) | Market Rent (Monthly) | Effective Rent (Monthly) | Lease Start Date | Lease End Date | Tenant Name
+
+STANDARDIZATION RULES:
+1. One row per tenant. Combine all charge lines for the same unit into one row.
+2. Effective Rent = base rent + housing subsidy (rentsub) - employee discounts (empdisc) - move-in discounts (discnewm). Do NOT include petfee, parkfee, amentfee, or trash.
+3. If rents are annual, divide by 12. If rent/sf is given, multiply by unit size to get monthly rent.
+4. Normalize all dates to MM/DD/YYYY. If date is missing, use null.
+5. Vacant rows: include if market rent is shown. Set Effective Rent to null, Tenant Name to "VACANT".
+6. Admin/Model units: include them. Set Effective Rent to null. Tenant Name = "ADMIN" or "MODEL".
+7. Future/pending leases with no active charges: exclude.
+8. Remove exact duplicate rows.
+9. Do NOT include subtotals, section headers, summary rows, or footers.
+10. Round all monetary values to 2 decimal places.
+
+Return ONLY a valid JSON array. No markdown, no explanation, no code fences. Just the raw JSON array starting with [ and ending with ].
+
+Input data (chunk {chunk_num} of {total_chunks}):
+{chunk_csv}
+"""
+
+    response = client.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=4096,
+        messages=[{"role": "user", "content": prompt}]
+    )
+
+    raw = response.content[0].text.strip()
+
+    # Strip markdown code fences if Claude added them
+    raw = re.sub(r"^```(?:json)?\s*\n?", "", raw, flags=re.MULTILINE)
+    raw = re.sub(r"\n?```\s*$", "", raw, flags=re.MULTILINE)
+    raw = raw.strip()
+
+    return json.loads(raw)
+
+
+def standardize_rent_roll(df: pd.DataFrame) -> pd.DataFrame:
     client = Anthropic(api_key=st.secrets["anthropic_api_key"])
 
-    standardized_dfs = []
     total_rows = len(df)
     num_chunks = (total_rows + CHUNK_SIZE - 1) // CHUNK_SIZE
+    all_results = []
+
+    progress_bar = st.progress(0)
+    status = st.empty()
 
     for i in range(num_chunks):
-        start_row = i * CHUNK_SIZE
-        end_row = min((i + 1) * CHUNK_SIZE, total_rows)
-        chunk_df = df.iloc[start_row:end_row]
+        start = i * CHUNK_SIZE
+        end = min((i + 1) * CHUNK_SIZE, total_rows)
+        chunk = df.iloc[start:end]
 
-        st.info(f"Processing chunk {i+1}/{num_chunks} (rows {start_row+1}-{end_row})...")
+        status.info(f"Processing chunk {i+1} of {num_chunks} (rows {start+1}–{end})...")
 
-        # Convert chunk to a string format suitable for Claude
-        # Using to_csv for simplicity, but could be more structured (e.g., JSON list of dicts)
-        chunk_csv = chunk_df.to_csv(index=False)
+        chunk_csv = chunk.to_csv(index=False)
 
-        # Using a raw string for the prompt message to avoid issues with backslashes
-        prompt_message = fr"""
-        You are an expert in multifamily real estate underwriting. Your task is to standardize rent roll data.
-        The user will provide a CSV string representing a portion of a rent roll. Convert this data into a standardized one-line-per-tenant format.
+        # Retry up to 3 times per chunk
+        last_error = None
+        for attempt in range(3):
+            try:
+                rows = call_claude(client, chunk_csv, i + 1, num_chunks)
+                all_results.extend(rows)
+                last_error = None
+                break
+            except json.JSONDecodeError as e:
+                last_error = f"Invalid JSON returned by Claude (attempt {attempt+1}/3): {e}"
+            except Exception as e:
+                last_error = f"Error on chunk {i+1} (attempt {attempt+1}/3): {e}"
 
-        Here are the required output columns and standardization rules:
+        if last_error:
+            status.empty()
+            st.error(last_error)
+            return pd.DataFrame()
 
-        REQUIRED STANDARD OUTPUT FORMAT (JSON array of objects, each object is a tenant):
-        [{{"Unit No": "string", "Unit Size (SF)": "number", "Market Rent (Monthly)": "number", "Effective Rent (Monthly)": "number", "Lease Start Date": "MM/DD/YYYY", "Lease End Date": "MM/DD/YYYY", "Tenant Name": "string"}}]
+        progress_bar.progress((i + 1) / num_chunks)
 
-        STANDARDIZATION RULES:
-        - Each tenant must appear on only one row.
-        - Convert any annual rents to monthly rents. If a rent column name suggests annual (e.g., 'Annual Rent'), divide by 12.
-        - If rent per square foot is given, calculate the total rent. Look for columns like 'Rent/SF' and 'Unit Size (SF)'.
-        - Normalize all dates to MM/DD/YYYY format. Handle various date formats (e.g., YYYY-MM-DD, M/D/YY).
-        - Remove duplicate rows based on a combination of 'Unit No' and 'Tenant Name'.
-        - Ignore fully vacant rows unless market rent is provided. A row is fully vacant if 'Tenant Name' is empty/null and 'Market Rent (Monthly)' is also empty/null or zero.
-        - Admin/model units must be included.
-        - Ensure all required columns are present in the output. If a column is missing from the input and cannot be derived, use null or an appropriate default.
+    status.empty()
 
-        Input Rent Roll CSV Chunk:
-        ```csv
-        {chunk_csv}
-        ```
-
-        Please return ONLY the JSON array of standardized tenant objects. Do not include any other text or explanation.
-        """
-
-        try:
-            response = client.messages.create(
-                model=CLAUDE_MODEL,
-                max_tokens=4000,
-                messages=[
-                    {"role": "user", "content": prompt_message}
-                ]
-            )
-            claude_output = response.content[0].text
-            
-            # Attempt to parse JSON response
-            standardized_data_list = json.loads(claude_output)
-            chunk_standardized_df = pd.DataFrame(standardized_data_list)
-            standardized_dfs.append(chunk_standardized_df)
-
-        except json.JSONDecodeError:
-            st.error(f"Claude returned invalid JSON for chunk {i+1}. Retrying or displaying error.")
-            # Implement retry logic here if needed
-            st.exception(f"Invalid JSON from Claude: {claude_output}")
-            return pd.DataFrame() # Return empty DataFrame on critical error
-        except Exception as e:
-            st.error(f"Error processing chunk {i+1} with Claude: {e}")
-            st.exception(e)
-            return pd.DataFrame() # Return empty DataFrame on critical error
-
-    if not standardized_dfs:
+    if not all_results:
         return pd.DataFrame()
 
-    # Combine all standardized chunks
-    final_standardized_df = pd.concat(standardized_dfs, ignore_index=True)
+    result_df = pd.DataFrame(all_results)
 
-    # --- Post-processing and Validation (after combining all chunks) ---
-    # Ensure correct columns and data types
+    # Ensure all required columns exist
     required_columns = [
         "Unit No", "Unit Size (SF)", "Market Rent (Monthly)",
         "Effective Rent (Monthly)", "Lease Start Date", "Lease End Date", "Tenant Name"
     ]
     for col in required_columns:
-        if col not in final_standardized_df.columns:
-            final_standardized_df[col] = None # Add missing columns
+        if col not in result_df.columns:
+            result_df[col] = None
 
-    # Reorder columns to match the required format
-    final_standardized_df = final_standardized_df[required_columns]
+    result_df = result_df[required_columns]
 
-    # Convert date columns to datetime objects, then format to MM/DD/YYYY
+    # Normalize dates
     for date_col in ["Lease Start Date", "Lease End Date"]:
-        # Using a raw string for the strftime format to avoid backslash issues
-        final_standardized_df[date_col] = pd.to_datetime(final_standardized_df[date_col], errors='coerce').dt.strftime(r'%m/%d/%Y')
+        result_df[date_col] = pd.to_datetime(
+            result_df[date_col], errors="coerce"
+        ).dt.strftime("%m/%d/%Y")
 
-    # Remove duplicate rows again after combining, based on Unit No and Tenant Name
-    final_standardized_df.drop_duplicates(subset=["Unit No", "Tenant Name"], inplace=True)
+    # Remove duplicates
+    result_df.drop_duplicates(subset=["Unit No", "Tenant Name"], inplace=True)
+    result_df.reset_index(drop=True, inplace=True)
 
-    return final_standardized_df
+    return result_df
 
 
-# --- Main Streamlit App Logic ---
+# --- Main App ---
 if check_password():
+
     st.title("Rent Roll Standardizer")
+    st.caption("Upload any broker Excel rent roll — get a clean, standardized output.")
 
-    uploaded_file = st.file_uploader("Upload an Excel Rent Roll File (.xlsx)", type=["xlsx"])
+    uploaded_file = st.file_uploader(
+        "Upload Excel Rent Roll (.xlsx)",
+        type=["xlsx"]
+    )
 
-    if uploaded_file is not None:
-        st.info("File uploaded successfully. Click \'Standardize Rent Roll\' to process.")
+    if uploaded_file:
+        st.success(f"File uploaded: **{uploaded_file.name}**")
 
         if st.button("Standardize Rent Roll"):
-            with st.spinner("Processing rent roll..."):
+
+            with st.spinner("Reading file..."):
                 try:
-                    original_df = pd.read_excel(uploaded_file)
-                    st.write("Original Rent Roll (first 5 rows):")
-                    st.dataframe(original_df.head())
-
-                    # Perform standardization using Claude
-                    standardized_df = standardize_rent_roll_with_claude(original_df)
-
-                    if not standardized_df.empty:
-                        st.success("Rent roll standardized successfully!")
-                        st.write("Standardized Rent Roll (first 5 rows):")
-                        st.dataframe(standardized_df.head())
-
-                        # --- Reconciliation Checks ---
-                        st.subheader("Reconciliation Checks")
-                        original_rows = len(original_df)
-                        cleaned_rows = len(standardized_df)
-                        st.write(f"- Original rows: {original_rows}")
-                        st.write(f"- Cleaned rows: {cleaned_rows}")
-
-                        if cleaned_rows == 0:
-                            st.warning("No rows were returned after standardization. Please check the input file.")
-                        elif cleaned_rows < original_rows:
-                            st.warning(f"Number of cleaned rows ({cleaned_rows}) is less than original rows ({original_rows}). This might be due to filtering vacant/duplicate rows.")
-                        elif cleaned_rows > original_rows:
-                            st.warning(f"Number of cleaned rows ({cleaned_rows}) is greater than original rows ({original_rows}). This is unexpected and might indicate an issue.")
-                        else:
-                            st.info("Number of rows after cleaning matches original (or is within expected range).")
-
-                        # Check for missing required columns
-                        required_columns = [
-                            "Unit No", "Unit Size (SF)", "Market Rent (Monthly)",
-                            "Effective Rent (Monthly)", "Lease Start Date", "Lease End Date", "Tenant Name"
-                        ]
-                        missing_cols = [col for col in required_columns if col not in standardized_df.columns or standardized_df[col].isnull().all()]
-                        if missing_cols:
-                            st.warning(f"Missing or entirely null required columns: {', '.join(missing_cols)}")
-                        else:
-                            st.info("All required columns are present.")
-
-                        # Provide download button for the standardized file
-                        output = io.BytesIO()
-                        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                            standardized_df.to_excel(writer, index=False, sheet_name='Standardized Rent Roll')
-                        processed_data = output.getvalue()
-
-                        st.download_button(
-                            label="Download Standardized Rent Roll",
-                            data=processed_data,
-                            file_name="standardized_rent_roll.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        )
-                    else:
-                        st.error("Standardization failed or returned no data.")
-
+                    original_df = pd.read_excel(uploaded_file, header=None)
                 except Exception as e:
-                    st.error(f"An error occurred during file processing: {e}")
-                    st.exception(e)
+                    st.error(f"Could not read the file: {e}")
+                    st.stop()
+
+            st.write(f"**Raw file:** {len(original_df)} rows × {original_df.shape[1]} columns")
+
+            standardized_df = standardize_rent_roll(original_df)
+
+            if standardized_df.empty:
+                st.error("Standardization failed or returned no data. Please check the file and try again.")
+                st.stop()
+
+            st.success("✅ Standardization complete!")
+
+            # --- Reconciliation ---
+            st.subheader("Reconciliation")
+
+            orig_rows    = len(original_df)
+            clean_rows   = len(standardized_df)
+            occupied     = standardized_df[
+                ~standardized_df["Tenant Name"].str.upper().isin(["VACANT", "ADMIN", "MODEL"])
+                & standardized_df["Tenant Name"].notna()
+            ]
+            vacant       = standardized_df[standardized_df["Tenant Name"].str.upper() == "VACANT"]
+            clean_mkt    = pd.to_numeric(standardized_df["Market Rent (Monthly)"], errors="coerce").sum()
+            avg_eff_rent = pd.to_numeric(standardized_df["Effective Rent (Monthly)"], errors="coerce").mean()
+            missing_cols = [c for c in ["Unit No", "Unit Size (SF)", "Market Rent (Monthly)",
+                                         "Effective Rent (Monthly)", "Lease Start Date",
+                                         "Lease End Date", "Tenant Name"]
+                            if c not in standardized_df.columns]
+
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("Total Rows (Cleaned)", clean_rows)
+            col2.metric("Occupied Tenants",     len(occupied))
+            col3.metric("Vacant Units",          len(vacant))
+            col4.metric("Avg Effective Rent",    f"${avg_eff_rent:,.0f}")
+
+            st.write("")
+
+            # Validation checks
+            if missing_cols:
+                st.warning(f"⚠️ Missing columns: {', '.join(missing_cols)}")
+            else:
+                st.success("✅ All required columns present")
+
+            if clean_rows < orig_rows * 0.3:
+                st.warning(
+                    f"⚠️ Cleaned output has {clean_rows} rows vs {orig_rows} raw rows. "
+                    "This is expected if the raw file has many header/footer/summary rows. "
+                    "Please review the preview below."
+                )
+            else:
+                st.success(f"✅ Row count looks reasonable ({clean_rows} cleaned from {orig_rows} raw rows)")
+
+            st.write(f"**Total Market Rent (cleaned):** ${clean_mkt:,.2f}")
+            st.write(f"**Occupied tenants:** {len(occupied)} &nbsp;|&nbsp; **Vacant units:** {len(vacant)}")
+
+            # --- Preview ---
+            st.subheader("Preview")
+            st.dataframe(standardized_df, use_container_width=True, height=400)
+
+            # --- Download ---
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+                standardized_df.to_excel(writer, index=False, sheet_name="Standardized Rent Roll")
+            output.seek(0)
+
+            base_name = uploaded_file.name.replace(".xlsx", "")
+            st.download_button(
+                label="⬇️ Download Standardized Rent Roll",
+                data=output.getvalue(),
+                file_name=f"{base_name}_standardized.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
 
     else:
         st.info("Please upload an Excel file to begin.")
-
