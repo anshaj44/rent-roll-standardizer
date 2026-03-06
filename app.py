@@ -40,7 +40,7 @@ html, body, [class*="css"] {
     color: #e2e8f0;
 }
 #MainMenu, footer, header { visibility: hidden; }
-.block-container { padding: 0 0 4rem; max-width: 100%; }
+.block-container { padding: 0 3rem 4rem; max-width: 100%; background: #111c27; }
 
 .rv-hero {
     background: linear-gradient(135deg, #0a1628 0%, #0d2137 40%, #0e3347 100%);
@@ -68,8 +68,6 @@ html, body, [class*="css"] {
 .rv-hero-right   { display: flex; align-items: center; gap: 1rem; z-index: 1; }
 .rv-badge  { background: rgba(46,196,182,0.12); border: 1px solid rgba(46,196,182,0.35); border-radius: 20px; padding: 0.35rem 1rem; font-size: 0.7rem; font-weight: 600; color: #2ec4b6; letter-spacing: 0.08em; text-transform: uppercase; }
 .rv-version{ font-size: 0.68rem; color: rgba(255,255,255,0.25); letter-spacing: 0.06em; }
-
-.rv-content { background: #111c27; min-height: 100vh; padding: 2rem 3rem 4rem; }
 
 .sec-label { font-size: 0.65rem; font-weight: 700; letter-spacing: 0.15em; text-transform: uppercase; color: #2ec4b6; display: flex; align-items: center; gap: 0.6rem; margin: 2rem 0 1rem; }
 .sec-label::after { content: ''; flex: 1; height: 1px; background: linear-gradient(90deg, rgba(46,196,182,0.3), transparent); }
@@ -197,7 +195,7 @@ def check_password():
         <p>RealVal · Multifamily Underwriting Intelligence</p></div>
       </div>
       <div class="rv-badge">Secure Access</div>
-    </div><div class="rv-content">""", unsafe_allow_html=True)
+    </div>""", unsafe_allow_html=True)
     col1, col2, col3 = st.columns([1.2, 1, 1.2])
     with col2:
         st.markdown("""
@@ -218,7 +216,7 @@ def check_password():
                 st.rerun()
             else:
                 st.error("Incorrect password.")
-    st.markdown("</div>", unsafe_allow_html=True)
+    st.markdown("&nbsp;", unsafe_allow_html=True)
     return False
 
 
@@ -685,7 +683,6 @@ st.markdown("""
     <div class="rv-badge">⚡ Claude AI</div>
   </div>
 </div>
-<div class="rv-content">
 """, unsafe_allow_html=True)
 
 # ── TABS: Main tool | Format Library ──────────────────────────────────────────
@@ -860,6 +857,5 @@ st.markdown("""
 <div class='rv-footer'>
   <span>© 2026 <a href='https://therealval.com' target='_blank'>RealVal</a> · Internal Tool · Confidential</span>
   <span>Powered by Claude AI (Haiku) · Prompt {PROMPT_VERSION} · Authorized analyst use only</span>
-</div>
 </div>
 """.replace("{PROMPT_VERSION}", PROMPT_VERSION), unsafe_allow_html=True)
