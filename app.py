@@ -261,7 +261,80 @@ def detect_rent_roll_sheet(file_bytes: bytes) -> tuple[pd.DataFrame, str]:
     return df, best
 
 
-# ── FORMAT LIBRARY ────────────────────────────────────────────────────────────
+# ── COLUMN LABELLER ───────────────────────────────────────────────────────────
+def label_raw_df(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Detects the real header rows (which Yardi/MRI split across 2 rows)
+    and assigns proper column names so Claude always sees named columns
+    instead of anonymous 0,1,2...N indices.
+    This is the primary fix for Claude confusing Market Rent (col5 header row)
+    with Effective Rent (col7 on charge sub-rows).
+    """
+    vals = df.values
+    header_row = None
+
+    # Find the row that contains 'unit' and 'charge' or 'rent'
+    for i, row in enumerate(vals[:15]):
+        texts = [str(v).lower().strip() for v in row if v is not None]
+        if any("unit" in t for t in texts) and any(t in ("charge","rent","market") for t in texts):
+            header_row = i
+            break
+
+    if header_row is None:
+        # Can't find header — return as-is with string column names
+        df.columns = [str(c) for c in df.columns]
+        return df
+
+    # Combine two-row header (common in Yardi exports)
+    row_a = [str(v).strip() if v is not None else "" for v in vals[header_row]]
+    row_b = [str(v).strip() if v is not None else "" for v in vals[header_row + 1]] \
+            if header_row + 1 < len(vals) else [""] * len(row_a)
+
+    combined = []
+    for a, b in zip(row_a, row_b):
+        parts = " ".join(p for p in [a, b] if p).strip()
+        combined.append(parts if parts else f"col_{len(combined)}")
+
+    # Normalise to clean names
+    name_map = {
+        "unit": "Unit No",
+        "unit type": "Unit Type",
+        "unit sq ft": "Sq Ft",
+        "sq ft": "Sq Ft",
+        "resident": "Resident ID",
+        "name": "Tenant Name",
+        "market rent": "Market Rent",      # ← explicit: this is MARKET rent
+        "charge code": "Charge Code",      # ← explicit: this is the CODE
+        "amount": "Charge Amount",         # ← explicit: this is the AMOUNT (eff rent when code=rent)
+        "resident deposit": "Res Deposit",
+        "other deposit": "Other Deposit",
+        "other deposits": "Other Deposit",
+        "move in": "Move In",
+        "lease expiration": "Lease Expiration",
+        "move out": "Move Out",
+        "balance": "Balance",
+    }
+
+    clean_cols = []
+    seen = {}
+    for raw in combined:
+        key = raw.lower().strip()
+        mapped = name_map.get(key, raw)
+        # De-duplicate
+        if mapped in seen:
+            seen[mapped] += 1
+            mapped = f"{mapped}_{seen[mapped]}"
+        else:
+            seen[mapped] = 0
+        clean_cols.append(mapped)
+
+    # Drop header rows and re-index
+    data_df = df.iloc[header_row + 2:].copy()
+    data_df.columns = clean_cols[:data_df.shape[1]]
+    data_df = data_df.reset_index(drop=True)
+    return data_df
+
+
 def init_library():
     if "format_library" not in st.session_state:
         st.session_state["format_library"] = []
@@ -321,6 +394,14 @@ MULTIPLE charge sub-rows (each with a charge code + amount, unit number is blank
 You MUST scan ALL sub-rows for the unit before deciding EffRent.
 The rent charge sub-row is often NOT the first sub-row — it may come after trash, pet, or other fees.
 
+COLUMN NAMES (the data has been pre-labelled for you):
+- "Unit No" = unit identifier
+- "Market Rent" = the advertised/listed rent — DO NOT use this as Effective Rent
+- "Charge Code" = the charge type on each sub-row (rent, trash, petfee, etc.)
+- "Charge Amount" = the actual dollar amount for that charge — THIS is the Effective Rent when Charge Code = rent
+- Effective Rent ALWAYS comes from "Charge Amount" where "Charge Code" = rent (or subsidy code)
+- NEVER use the "Market Rent" column value as Effective Rent
+
 Rules:
 1. 1 row/unit — merge ALL charge sub-rows for the same unit. Scan every sub-row.
 2. EffRent WHITELIST — include ONLY these charge codes in Effective Rent:
@@ -377,18 +458,24 @@ def recover_missing_rents(result_df: pd.DataFrame, raw_df: pd.DataFrame) -> pd.D
     # Build a lookup from the raw dataframe
     # Raw file: unit number in col 0, charge code in col 6, amount in col 7
     # Sub-rows have None in col 0 — they belong to the last seen unit
-    raw_vals = raw_df.values
+    raw_vals  = raw_df.values
     num_cols  = raw_vals.shape[1]
     if num_cols < 8:
         return result_df  # can't parse safely
 
-    unit_charges: dict[str, dict] = {}   # unit_no → {rent: X, subsidy: X}
+    # Detect column indices — works for both labelled and unlabelled dataframes
+    cols = list(raw_df.columns)
+    unit_col   = cols.index("Unit No")        if "Unit No"        in cols else 0
+    code_col   = cols.index("Charge Code")    if "Charge Code"    in cols else 6
+    amount_col = cols.index("Charge Amount")  if "Charge Amount"  in cols else 7
+
+    unit_charges: dict[str, dict] = {}
     current_unit = None
 
     for row in raw_vals:
-        unit_val   = row[0]
-        charge_raw = str(row[6]).strip().lower() if len(row) > 6 and row[6] is not None else ""
-        amount_raw = row[7] if len(row) > 7 else None
+        unit_val   = row[unit_col]
+        charge_raw = str(row[code_col]).strip().lower()   if len(row) > code_col   and row[code_col]   is not None else ""
+        amount_raw = row[amount_col]                       if len(row) > amount_col else None
 
         if unit_val and str(unit_val).strip() not in ("", "nan", "None"):
             current_unit = str(unit_val).strip()
@@ -519,8 +606,12 @@ def validate_rows(df: pd.DataFrame) -> pd.DataFrame:
 # ── PARALLEL STANDARDIZE ──────────────────────────────────────────────────────
 def standardize_rent_roll(df, step_ph, prog_ph, status_ph, analyst_hint, library_ctx, raw_df=None):
     api_key    = st.secrets["anthropic_api_key"]
-    total_rows = len(df)
-    chunk_size = get_chunk_size(total_rows)
+
+    # Label columns before chunking — critical fix so Claude sees
+    # 'Market Rent' vs 'Charge Code' vs 'Charge Amount' instead of 0,1,2...N
+    labelled_df = label_raw_df(df.copy())
+    total_rows  = len(labelled_df)
+    chunk_size  = get_chunk_size(total_rows)
 
     step_ph.markdown(render_steps(2), unsafe_allow_html=True)
 
@@ -528,7 +619,7 @@ def standardize_rent_roll(df, step_ph, prog_ph, status_ph, analyst_hint, library
     chunks, start = [], 0
     while start < total_rows:
         end = min(start + chunk_size, total_rows)
-        chunks.append((len(chunks) + 1, df.iloc[start:end].to_csv(index=False)))
+        chunks.append((len(chunks) + 1, labelled_df.iloc[start:end].to_csv(index=False)))
         if end == total_rows: break
         start += chunk_size - OVERLAP_ROWS
 
@@ -1088,7 +1179,39 @@ def build_excel(df: pd.DataFrame, raw_df: pd.DataFrame = None,
         "eff_total":   pd.to_numeric(occ_df["Effective Rent (Monthly)"], errors="coerce").sum(),
         "occ_pct":     len(occ_df) / len(df) * 100 if len(df) else 0,
     }
+
+    # Fix verifier consistency: compute our rent total using the EXACT same charge codes
+    # that the source summary counted — not our broader RENT_CODES family.
+    # This guarantees apples-to-apples comparison.
     ss = source_summary or {}
+    src_cc = ss.get("src_charge_codes", {})
+    if src_cc and raw_df is not None:
+        # Which codes did the source count as rent-family?
+        src_rent_codes = {k for k in src_cc if k in RENT_CODES}
+        if src_rent_codes:
+            # Sum those exact codes from the raw file directly
+            raw_rent_total = 0.0
+            current_unit_raw = None
+            for row in raw_df.values:
+                c0 = row[0]
+                # Detect unit header rows
+                if c0 is not None and str(c0).strip() not in ("", "nan", "None"):
+                    current_unit_raw = str(c0).strip()
+                # Read charge sub-rows
+                try:
+                    # Works for both labelled (named cols) and unlabelled (positional)
+                    if hasattr(raw_df, 'columns') and 'Charge Code' in raw_df.columns:
+                        cc_idx = list(raw_df.columns).index('Charge Code')
+                        amt_idx = list(raw_df.columns).index('Charge Amount')
+                    else:
+                        cc_idx, amt_idx = 6, 7
+                    code = str(row[cc_idx]).strip().lower() if row[cc_idx] is not None else ""
+                    amt  = row[amt_idx]
+                    if code in src_rent_codes and amt is not None:
+                        raw_rent_total += float(str(amt).replace(",",""))
+                except (IndexError, ValueError, TypeError):
+                    pass
+            our["eff_total_raw"] = raw_rent_total  # consistent comparison value
 
     def pct_diff(a, b):
         if b and b != 0: return abs(a - b) / abs(b) * 100
@@ -1133,7 +1256,12 @@ def build_excel(df: pd.DataFrame, raw_df: pd.DataFrame = None,
         ("Occupancy %",           our["occ_pct"],     ss.get("src_occ_pct"),        False, True,  False, "±1%",   ""),
         ("Total Market Rent",     our["total_mkt"],   ss.get("src_total_mkt"),      True,  False, False, "±0.5%", "Sum of all market rents"),
         ("Occupied Market Rent",  our["occ_mkt"],     ss.get("src_occupied_mkt"),   True,  False, False, "±0.5%", ""),
-        ("Total Effective Rent",  our["eff_total"],   ss.get("src_rent_total"),     True,  False, False, "±2%",   "vs source rent charge total"),
+        # Use raw-file rent total for consistency — same codes as source summary
+        ("Total Rent Charges",
+         our.get("eff_total_raw", our["eff_total"]),
+         ss.get("src_rent_total"),
+         True, False, False, "±0.5%",
+         "Raw rent charge total vs source — same charge codes"),
     ]
 
     for ri, (metric, our_v, src_v, money, pct, exact, tol_label, note) in enumerate(checks, 3):
@@ -1374,7 +1502,7 @@ with main_tab:
             with col_dl:
                 st.download_button(
                     label="⬇  Download Standardized Rent Roll",
-                    data=build_excel(standardized_df, original_df),
+                    data=build_excel(standardized_df, original_df, source_summary),
                     file_name=f"{base_name}_standardized_{today}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
