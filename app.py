@@ -16,7 +16,7 @@ CLAUDE_MODEL   = "claude-haiku-4-5-20251001"
 OVERLAP_ROWS   = 8
 MAX_RETRIES    = 3
 MAX_CONCURRENT = 3    # max parallel API connections — stays under rate limit
-PROMPT_VERSION = "v5.2"
+PROMPT_VERSION = "v5.3"
 
 # Larger chunks = fewer API calls = lower cost
 def get_chunk_size(total_rows: int) -> int:
@@ -313,8 +313,8 @@ def build_prompt(chunk_text: str, chunk_num: int, total_chunks: int,
                  analyst_hint: str, library_ctx: str) -> str:
     hint = f"\nNOTE: {analyst_hint.strip()}" if analyst_hint.strip() else ""
     return f"""Multifamily rent roll standardizer. ({PROMPT_VERSION})
-Output: JSON array, 7 columns + optional flag field.
-Columns: Unit No | Unit Size (SF) | Market Rent (Monthly) | Effective Rent (Monthly) | Lease Start Date | Lease End Date | Tenant Name
+Output: JSON array, 9 columns + optional flag field.
+Columns: Unit No | Unit Size (SF) | Market Rent (Monthly) | Effective Rent (Monthly) | Move In Date | Lease Start Date | Lease End Date | Move Out Date | Tenant Name
 
 CRITICAL: A unit block has ONE header row (with unit number, tenant name) followed by
 MULTIPLE charge sub-rows (each with a charge code + amount, unit number is blank).
@@ -570,13 +570,13 @@ def standardize_rent_roll(df, step_ph, prog_ph, status_ph, analyst_hint, library
         return pd.DataFrame()
 
     result_df = pd.DataFrame(all_rows)
-    COLS = ["Unit No","Unit Size (SF)","Market Rent (Monthly)",
-            "Effective Rent (Monthly)","Lease Start Date","Lease End Date","Tenant Name"]
+    COLS = ["Unit No","Unit Size (SF)","Market Rent (Monthly)","Effective Rent (Monthly)",
+            "Move In Date","Lease Start Date","Lease End Date","Move Out Date","Tenant Name"]
     for col in COLS:
         if col not in result_df.columns: result_df[col] = None
     result_df = result_df[COLS + (["flag"] if "flag" in result_df.columns else [])]
 
-    for dc in ["Lease Start Date","Lease End Date"]:
+    for dc in ["Move In Date","Lease Start Date","Lease End Date","Move Out Date"]:
         result_df[dc] = pd.to_datetime(result_df[dc], errors="coerce").dt.strftime("%m/%d/%Y")
 
     result_df.drop_duplicates(subset=["Unit No"], keep="first", inplace=True)
@@ -594,8 +594,8 @@ def standardize_rent_roll(df, step_ph, prog_ph, status_ph, analyst_hint, library
 
 # ── COLOR-CODED TABLE ─────────────────────────────────────────────────────────
 def render_table(df: pd.DataFrame) -> str:
-    COLS = ["Unit No","Unit Size (SF)","Market Rent (Monthly)",
-            "Effective Rent (Monthly)","Lease Start Date","Lease End Date","Tenant Name"]
+    COLS = ["Unit No","Unit Size (SF)","Market Rent (Monthly)","Effective Rent (Monthly)",
+            "Move In Date","Lease Start Date","Lease End Date","Move Out Date","Tenant Name"]
     hdr  = "".join(f"<th>{c}</th>" for c in COLS) + "<th>Status</th>"
     body = ""
     flag_col = "flag" in df.columns
@@ -780,97 +780,426 @@ def render_recon(df: pd.DataFrame, orig_rows: int) -> str:
     return html + "</div>"
 
 
-# ── EXCEL EXPORT ──────────────────────────────────────────────────────────────
-def build_excel(df: pd.DataFrame, raw_df: pd.DataFrame = None) -> bytes:
-    wb  = Workbook()
+# ── SOURCE SUMMARY EXTRACTOR ──────────────────────────────────────────────────
+def extract_source_summary(raw_df: pd.DataFrame) -> dict | None:
+    """
+    Scans the raw dataframe for the summary block that most Yardi/MRI/AppFolio
+    exports include at the bottom (total units, occupied, vacant, market rent, etc.)
+    Returns a dict of extracted values, or None if no summary found.
+    """
+    if raw_df is None or raw_df.empty:
+        return None
 
-    # ── Sheet 1: Standardized ──
-    ws  = wb.active; ws.title = "Standardized Rent Roll"
-    navy="0A2E3D"; thin=Side(style="thin",color="E2E8F0")
-    bdr=Border(left=thin,right=thin,top=thin,bottom=thin)
-    COLS=["Unit No","Unit Size (SF)","Market Rent (Monthly)",
-          "Effective Rent (Monthly)","Lease Start Date","Lease End Date","Tenant Name"]
-    for col,h in enumerate(COLS,1):
-        c=ws.cell(row=1,column=col,value=h)
-        c.font=Font(name="Calibri",bold=True,color="FFFFFF",size=10)
-        c.fill=PatternFill("solid",start_color=navy)
-        c.alignment=Alignment(horizontal="center",vertical="center",wrap_text=True)
-        c.border=bdr
-    ws.row_dimensions[1].height=28
-    flag_col="flag" in df.columns
-    for ri,rec in enumerate(df.itertuples(index=False),2):
-        nm=str(rec[6] or "").upper()
-        iv=nm=="VACANT"; nr=nm in("ADMIN","MODEL")
-        is_flagged=bool(getattr(rec,"flag",False)) if flag_col else False
-        fill=(PatternFill("solid",start_color="FFFBEB") if iv else
-              PatternFill("solid",start_color="F0FDF4") if nr else
-              PatternFill("solid",start_color="FFF9EB") if is_flagged else
-              PatternFill("solid",start_color="FFFFFF") if ri%2 else
-              PatternFill("solid",start_color="F8FAFC"))
-        for col,val in enumerate(rec[:7],1):
-            c=ws.cell(row=ri,column=col,value=val); c.border=bdr; c.fill=fill
-            c.font=Font(name="Calibri",size=10,italic=(iv or nr),
-                        color=("92400E" if iv else "166534" if nr else "854D0E" if is_flagged else "1E293B"))
-            if col==2:        c.number_format="#,##0";     c.alignment=Alignment(horizontal="right")
-            elif col in(3,4): c.number_format="$#,##0.00"; c.alignment=Alignment(horizontal="right")
-            elif col in(5,6): c.alignment=Alignment(horizontal="center")
-            else:             c.alignment=Alignment(horizontal="left")
-    last=len(df)+1; tot=last+1
-    for col in range(1,8):
-        c=ws.cell(row=tot,column=col)
-        c.fill=PatternFill("solid",start_color=navy)
-        c.font=Font(name="Calibri",bold=True,color="FFFFFF",size=10)
-        c.border=bdr; c.alignment=Alignment(horizontal="right")
-    ws.cell(row=tot,column=1,value="TOTALS / AVERAGES").alignment=Alignment(horizontal="left")
-    ws.cell(row=tot,column=2,value=f"=SUM(B2:B{last})").number_format="#,##0"
-    ws.cell(row=tot,column=3,value=f"=AVERAGE(C2:C{last})").number_format="$#,##0.00"
-    ws.cell(row=tot,column=4,value=f'=AVERAGEIF(D2:D{last},"<>",D2:D{last})').number_format="$#,##0.00"
-    nr2=tot+2
-    for i,note in enumerate(["Notes:",
-        "• Yellow rows = Vacant units","• Green rows = Non-revenue (Admin/Model)",
-        "• Orange rows = ⚠ Flagged for review (unusual effective rent or low confidence)",
+    summary = {}
+    vals = raw_df.values
+
+    # Keywords we search for in the first column (case-insensitive)
+    OCCUPIED_KW  = {"occupied units", "occupied"}
+    VACANT_KW    = {"total vacant units", "vacant units", "vacant"}
+    NONREV_KW    = {"total non rev units", "non rev units", "non-revenue", "admin/model", "model/admin"}
+    TOTALS_KW    = {"totals:", "totals", "grand total", "total"}
+    SUMMARY_KW   = {"summary groups", "summary group", "summary"}
+    CHARGECODE_KW= {"summary of charges", "charge code"}
+
+    in_chargecode_section = False
+    charge_codes: dict[str, float] = {}
+
+    for row in vals:
+        c0 = str(row[0]).strip().lower() if row[0] is not None else ""
+
+        # Detect charge code section
+        if any(kw in c0 for kw in CHARGECODE_KW):
+            in_chargecode_section = True
+            continue
+
+        if in_chargecode_section:
+            # charge code rows: col0=code, col3=amount
+            code = c0
+            if code in ("total", "", "charge code", "nan"):
+                if code == "total":
+                    in_chargecode_section = False
+                continue
+            try:
+                amt_raw = row[3] if len(row) > 3 else None
+                if amt_raw is not None:
+                    amt = float(str(amt_raw).replace(",", "").replace("(", "-").replace(")", ""))
+                    charge_codes[code] = amt
+            except (ValueError, TypeError):
+                pass
+            continue
+
+        # Occupied units row
+        if any(kw == c0 for kw in OCCUPIED_KW):
+            try:
+                summary["src_occupied_units"]  = int(float(str(row[10]).replace(",",""))) if len(row) > 10 and row[10] else None
+                summary["src_occupied_mkt"]    = float(str(row[6]).replace(",",""))       if len(row) > 6  and row[6]  else None
+            except (ValueError, TypeError): pass
+
+        # Vacant units row
+        elif any(kw == c0 for kw in VACANT_KW):
+            try:
+                summary["src_vacant_units"]    = int(float(str(row[10]).replace(",",""))) if len(row) > 10 and row[10] else None
+                summary["src_vacant_mkt"]      = float(str(row[6]).replace(",",""))       if len(row) > 6  and row[6]  else None
+            except (ValueError, TypeError): pass
+
+        # Non-rev units row
+        elif any(kw == c0 for kw in NONREV_KW):
+            try:
+                summary["src_nonrev_units"]    = int(float(str(row[10]).replace(",",""))) if len(row) > 10 and row[10] else None
+                summary["src_nonrev_mkt"]      = float(str(row[6]).replace(",",""))       if len(row) > 6  and row[6]  else None
+            except (ValueError, TypeError): pass
+
+        # Totals row
+        elif any(kw == c0 for kw in TOTALS_KW) and not any(kw in c0 for kw in CHARGECODE_KW):
+            try:
+                summary["src_total_units"]     = int(float(str(row[10]).replace(",",""))) if len(row) > 10 and row[10] else None
+                summary["src_total_mkt"]       = float(str(row[6]).replace(",",""))       if len(row) > 6  and row[6]  else None
+                summary["src_occ_pct"]         = float(str(row[11]).replace(",",""))      if len(row) > 11 and row[11] else None
+                summary["src_lease_charges"]   = float(str(row[7]).replace(",",""))       if len(row) > 7  and row[7]  else None
+            except (ValueError, TypeError): pass
+
+    if charge_codes:
+        summary["src_charge_codes"] = charge_codes
+        # Sum of rent-family codes = source effective rent total
+        rent_total = sum(v for k, v in charge_codes.items() if k in RENT_CODES)
+        if rent_total:
+            summary["src_rent_total"] = rent_total
+
+    return summary if summary else None
+
+
+# ── SOURCE VERIFIER PANEL ─────────────────────────────────────────────────────
+def render_source_verifier(standardized_df: pd.DataFrame, src: dict) -> str:
+    """
+    Side-by-side comparison: source file summary vs our standardized output.
+    Each row shows the source number, our number, and a pass/warn/fail badge.
+    """
+    if not src:
+        return ""
+
+    NON_REVENUE = {"VACANT", "ADMIN", "MODEL"}
+    occ = standardized_df[
+        standardized_df["Tenant Name"].notna()
+        & ~standardized_df["Tenant Name"].astype(str).str.strip().str.upper().isin(NON_REVENUE)
+        & (standardized_df["Tenant Name"].astype(str).str.strip() != "")
+    ]
+    vac = standardized_df[
+        standardized_df["Tenant Name"].astype(str).str.strip().str.upper() == "VACANT"
+    ]
+    nr  = standardized_df[
+        standardized_df["Tenant Name"].astype(str).str.strip().str.upper().isin({"ADMIN","MODEL"})
+    ]
+
+    our_total_units   = len(standardized_df)
+    our_occupied      = len(occ)
+    our_vacant        = len(vac)
+    our_nonrev        = len(nr)
+    our_total_mkt     = pd.to_numeric(standardized_df["Market Rent (Monthly)"], errors="coerce").sum()
+    our_eff_total     = pd.to_numeric(occ["Effective Rent (Monthly)"], errors="coerce").sum()
+
+    def badge(ok, warn=False):
+        if ok:   return "<span class='r-badge rb-pass'>✓ Match</span>"
+        if warn: return "<span class='r-badge rb-warn'>⚠ Close</span>"
+        return           "<span class='r-badge rb-fail'>✗ Mismatch</span>"
+
+    def fmt_num(v, is_currency=False):
+        if v is None or (isinstance(v, float) and pd.isna(v)): return "—"
+        if is_currency: return f"${v:,.0f}"
+        return f"{int(v):,}"
+
+    def pct_ok(src_v, our_v, tol=0.02):
+        if src_v is None or our_v is None: return None
+        if src_v == 0: return our_v == 0
+        return abs(src_v - our_v) / abs(src_v) <= tol
+
+    rows_html = ""
+
+    checks = []
+
+    # Total units
+    sv = src.get("src_total_units"); ov = our_total_units
+    ok = (sv == ov) if sv is not None else None
+    checks.append(("Total Units", fmt_num(sv), fmt_num(ov), ok, False))
+
+    # Occupied
+    sv = src.get("src_occupied_units"); ov = our_occupied
+    ok = (sv == ov) if sv is not None else None
+    checks.append(("Occupied Units", fmt_num(sv), fmt_num(ov), ok, False))
+
+    # Vacant
+    sv = src.get("src_vacant_units"); ov = our_vacant
+    ok = (sv == ov) if sv is not None else None
+    checks.append(("Vacant Units", fmt_num(sv), fmt_num(ov), ok, False))
+
+    # Non-rev
+    sv = src.get("src_nonrev_units"); ov = our_nonrev
+    ok = (sv == ov) if sv is not None else None
+    checks.append(("Non-Revenue Units", fmt_num(sv), fmt_num(ov), ok, False))
+
+    # Total market rent (allow 1% tolerance for rounding)
+    sv = src.get("src_total_mkt"); ov = our_total_mkt
+    ok = pct_ok(sv, ov, 0.01)
+    warn = (ok is None) or (not ok and pct_ok(sv, ov, 0.05))
+    checks.append(("Total Market Rent", fmt_num(sv, True), fmt_num(ov, True), ok, warn and not ok))
+
+    # Rent charge total from source vs our effective rent total (allow 2% — concessions etc.)
+    sv = src.get("src_rent_total"); ov = our_eff_total
+    ok = pct_ok(sv, ov, 0.02)
+    warn = (ok is None) or (not ok and pct_ok(sv, ov, 0.08))
+    checks.append(("Total Effective Rent (rent charges)", fmt_num(sv, True), fmt_num(ov, True), ok, warn and not ok))
+
+    for label, src_val, our_val, ok, warn in checks:
+        if ok is True:    icon, st_cls = "✓", "pass"
+        elif ok is False and not warn: icon, st_cls = "✗", "fail"
+        else:             icon, st_cls = "⚠", "warn"
+        rows_html += f"""
+        <tr>
+          <td style='padding:0.55rem 1rem;font-size:0.8rem;color:#e2e8f0;font-weight:500;'>{label}</td>
+          <td style='padding:0.55rem 1rem;font-size:0.8rem;color:#7dd3fc;text-align:right;font-family:monospace;'>{src_val}</td>
+          <td style='padding:0.55rem 1rem;font-size:0.8rem;color:#a3e635;text-align:right;font-family:monospace;'>{our_val}</td>
+          <td style='padding:0.55rem 1rem;text-align:center;'>
+            <div class='r-icon {st_cls}' style='width:28px;height:28px;border-radius:6px;font-size:0.8rem;margin:auto;'>{icon}</div>
+          </td>
+        </tr>"""
+
+    # Charge code breakdown table (if available)
+    cc_html = ""
+    cc = src.get("src_charge_codes", {})
+    if cc:
+        cc_rows = ""
+        for code, amt in sorted(cc.items(), key=lambda x: -abs(x[1])):
+            colour = "#4ade80" if code in RENT_CODES else "#94a3b8"
+            cc_rows += f"<tr><td style='padding:0.35rem 0.8rem;font-size:0.75rem;color:{colour};font-family:monospace;'>{code}</td><td style='padding:0.35rem 0.8rem;font-size:0.75rem;color:#e2e8f0;text-align:right;font-family:monospace;'>${amt:,.0f}</td></tr>"
+        cc_html = f"""
+        <div style='margin-top:1rem;background:#0a1628;border:1px solid rgba(255,255,255,0.06);border-radius:10px;overflow:hidden;'>
+          <div style='padding:0.5rem 0.8rem;background:#0d2137;font-size:0.65rem;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:rgba(255,255,255,0.4);'>
+            Charge Code Breakdown (Source File)
+          </div>
+          <table style='width:100%;border-collapse:collapse;'>{cc_rows}</table>
+        </div>"""
+
+    return f"""
+    <div style='background:#0d1e2e;border:1px solid rgba(46,196,182,0.2);border-radius:12px;overflow:hidden;margin-bottom:1.5rem;'>
+      <div style='background:linear-gradient(135deg,#0a1f32,#0d2840);padding:0.75rem 1.2rem;border-bottom:1px solid rgba(46,196,182,0.15);display:flex;align-items:center;justify-content:space-between;'>
+        <span style='font-size:0.72rem;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;color:rgba(255,255,255,0.5);'>Source File Verifier — Standardizer vs Original Summary</span>
+        <span style='font-size:0.68rem;color:rgba(46,196,182,0.6);'>Extracted from source footer</span>
+      </div>
+      <table style='width:100%;border-collapse:collapse;'>
+        <thead>
+          <tr style='background:rgba(255,255,255,0.03);'>
+            <th style='padding:0.5rem 1rem;font-size:0.68rem;font-weight:600;letter-spacing:0.05em;text-transform:uppercase;color:rgba(255,255,255,0.35);text-align:left;'>Metric</th>
+            <th style='padding:0.5rem 1rem;font-size:0.68rem;font-weight:600;letter-spacing:0.05em;text-transform:uppercase;color:#7dd3fc;text-align:right;'>Source File</th>
+            <th style='padding:0.5rem 1rem;font-size:0.68rem;font-weight:600;letter-spacing:0.05em;text-transform:uppercase;color:#a3e635;text-align:right;'>Our Output</th>
+            <th style='padding:0.5rem 1rem;font-size:0.68rem;font-weight:600;letter-spacing:0.05em;text-transform:uppercase;color:rgba(255,255,255,0.35);text-align:center;'>Check</th>
+          </tr>
+        </thead>
+        <tbody>{rows_html}</tbody>
+      </table>
+      <div style='padding:0 1rem 0.8rem;'>{cc_html}</div>
+    </div>"""
+
+
+def build_excel(df: pd.DataFrame, raw_df: pd.DataFrame = None,
+                source_summary: dict = None) -> bytes:
+    wb   = Workbook()
+    navy = "0A2E3D"; teal = "0E4A5C"
+    thin = Side(style="thin", color="E2E8F0")
+    bdr  = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    COLS = ["Unit No","Unit Size (SF)","Market Rent (Monthly)","Effective Rent (Monthly)",
+            "Move In Date","Lease Start Date","Lease End Date","Move Out Date","Tenant Name"]
+    DATE_COLS  = {5, 6, 7, 8}
+    MONEY_COLS = {3, 4}
+
+    # Sheet 1: Standardized
+    ws = wb.active; ws.title = "Standardized Rent Roll"
+    for col, h in enumerate(COLS, 1):
+        c = ws.cell(row=1, column=col, value=h)
+        c.font = Font(name="Calibri", bold=True, color="FFFFFF", size=10)
+        c.fill = PatternFill("solid", start_color=navy)
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        c.border = bdr
+    ws.row_dimensions[1].height = 30
+
+    flag_col = "flag" in df.columns
+    for ri, rec in enumerate(df.itertuples(index=False), 2):
+        nm = str(rec[8] or "").upper()
+        iv = nm == "VACANT"; nr = nm in ("ADMIN", "MODEL")
+        is_flagged = bool(getattr(rec, "flag", False)) if flag_col else False
+        fill = (PatternFill("solid", start_color="FFFBEB") if iv else
+                PatternFill("solid", start_color="F0FDF4") if nr else
+                PatternFill("solid", start_color="FFF9EB") if is_flagged else
+                PatternFill("solid", start_color="FFFFFF") if ri % 2 else
+                PatternFill("solid", start_color="F8FAFC"))
+        fc = "92400E" if iv else "166534" if nr else "854D0E" if is_flagged else "1E293B"
+        for col, val in enumerate(rec[:9], 1):
+            c = ws.cell(row=ri, column=col, value=val)
+            c.border = bdr; c.fill = fill
+            c.font = Font(name="Calibri", size=10, italic=(iv or nr), color=fc)
+            if col == 2:             c.number_format = "#,##0";     c.alignment = Alignment(horizontal="right")
+            elif col in MONEY_COLS:  c.number_format = "$#,##0.00"; c.alignment = Alignment(horizontal="right")
+            elif col in DATE_COLS:   c.alignment = Alignment(horizontal="center")
+            else:                    c.alignment = Alignment(horizontal="left")
+
+    last = len(df) + 1; tot = last + 1
+    for col in range(1, len(COLS) + 1):
+        c = ws.cell(row=tot, column=col)
+        c.fill = PatternFill("solid", start_color=navy)
+        c.font = Font(name="Calibri", bold=True, color="FFFFFF", size=10)
+        c.border = bdr; c.alignment = Alignment(horizontal="right")
+    ws.cell(row=tot, column=1, value="TOTALS / AVERAGES").alignment = Alignment(horizontal="left")
+    ws.cell(row=tot, column=2, value=f"=SUM(B2:B{last})").number_format = "#,##0"
+    ws.cell(row=tot, column=3, value=f"=AVERAGE(C2:C{last})").number_format = "$#,##0.00"
+    ws.cell(row=tot, column=4, value=f'=AVERAGEIF(D2:D{last},"<>",D2:D{last})').number_format = "$#,##0.00"
+
+    nr2 = tot + 2
+    for i, note in enumerate(["Notes:",
+        "• Yellow = Vacant", "• Green = Non-revenue (Admin/Model)",
+        "• Orange = Flagged — verify Effective Rent manually",
         "• Effective Rent = base rent + housing subsidy only",
-        "• Concessions, cable, parking, utilities, fees all excluded from Effective Rent"]):
-        c=ws.cell(row=nr2+i,column=1,value=note)
-        c.font=Font(name="Calibri",bold=(i==0),size=9,
-                    color=("166534" if "Green" in note else "92400E" if "Yellow" in note
-                           else "854D0E" if "Orange" in note else "595959"))
-    for i,w in enumerate([14,14,22,24,16,16,26],1):
-        ws.column_dimensions[get_column_letter(i)].width=w
-    ws.freeze_panes="A2"; ws.auto_filter.ref=f"A1:G{last}"
+        "• Concessions, cable, parking, utilities, fees excluded"]):
+        c = ws.cell(row=nr2 + i, column=1, value=note)
+        c.font = Font(name="Calibri", bold=(i == 0), size=9,
+                      color="166534" if "Green" in note else
+                            "92400E" if "Yellow" in note else
+                            "854D0E" if "Orange" in note else "595959")
 
-    # ── Sheet 2: Raw File ──
+    for i, w in enumerate([14, 14, 22, 24, 14, 16, 16, 14, 28], 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(COLS))}{last}"
+
+    # Sheet 2: Source Verification
+    ws2 = wb.create_sheet(title="Source Verification")
+    NON_REV = {"VACANT", "ADMIN", "MODEL"}
+    occ_df  = df[df["Tenant Name"].notna() &
+                 ~df["Tenant Name"].astype(str).str.strip().str.upper().isin(NON_REV) &
+                 (df["Tenant Name"].astype(str).str.strip() != "")]
+    vac_df  = df[df["Tenant Name"].astype(str).str.strip().str.upper() == "VACANT"]
+    nr_df   = df[df["Tenant Name"].astype(str).str.strip().str.upper().isin({"ADMIN","MODEL"})]
+
+    our = {
+        "total_units": len(df),
+        "occ_units":   len(occ_df),
+        "vac_units":   len(vac_df),
+        "nr_units":    len(nr_df),
+        "total_mkt":   pd.to_numeric(df["Market Rent (Monthly)"],       errors="coerce").sum(),
+        "occ_mkt":     pd.to_numeric(occ_df["Market Rent (Monthly)"],   errors="coerce").sum(),
+        "eff_total":   pd.to_numeric(occ_df["Effective Rent (Monthly)"], errors="coerce").sum(),
+        "occ_pct":     len(occ_df) / len(df) * 100 if len(df) else 0,
+    }
+    ss = source_summary or {}
+
+    def pct_diff(a, b):
+        if b and b != 0: return abs(a - b) / abs(b) * 100
+        return None
+
+    def vstatus(our_v, src_v, tol=0.5, exact=False):
+        if src_v is None: return "N/A", "F1F5F9", "64748B"
+        if exact:
+            return ("MATCH", "DCFCE7", "166534") if our_v == src_v else ("MISMATCH", "FEE2E2", "991B1B")
+        d = pct_diff(our_v, src_v)
+        if d is None:    return "N/A",            "F1F5F9", "64748B"
+        if d <= tol:     return "MATCH",           "DCFCE7", "166534"
+        if d <= 2.0:     return f"OFF {d:.1f}%",   "FEF9C3", "854D0E"
+        return                  f"MISMATCH {d:.1f}%","FEE2E2", "991B1B"
+
+    def fmtv(v, money=False, pct=False):
+        if v is None: return "Not found"
+        if money: return f"${v:,.2f}"
+        if pct:   return f"{v:.2f}%"
+        return f"{int(v):,}"
+
+    ws2.merge_cells("A1:G1")
+    h1 = ws2["A1"]
+    h1.value = "SOURCE FILE VERIFICATION"
+    h1.font  = Font(name="Calibri", bold=True, color="FFFFFF", size=12)
+    h1.fill  = PatternFill("solid", start_color=navy)
+    h1.alignment = Alignment(horizontal="center", vertical="center")
+    ws2.row_dimensions[1].height = 28
+
+    hdrs2 = ["Metric", "Source File", "Our Output", "Difference", "Status", "Tolerance", "Note"]
+    for ci, h in enumerate(hdrs2, 1):
+        c = ws2.cell(row=2, column=ci, value=h)
+        c.font = Font(name="Calibri", bold=True, color="FFFFFF", size=9)
+        c.fill = PatternFill("solid", start_color=teal)
+        c.alignment = Alignment(horizontal="center")
+
+    checks = [
+        ("Total Units",           our["total_units"], ss.get("src_total_units"),    False, False, True,  "Exact", "All incl. vacant & non-rev"),
+        ("Occupied Units",        our["occ_units"],   ss.get("src_occupied_units"), False, False, True,  "Exact", ""),
+        ("Vacant Units",          our["vac_units"],   ss.get("src_vacant_units"),   False, False, True,  "Exact", ""),
+        ("Non-Revenue Units",     our["nr_units"],    ss.get("src_nonrev_units"),   False, False, True,  "Exact", "Admin & Model"),
+        ("Occupancy %",           our["occ_pct"],     ss.get("src_occ_pct"),        False, True,  False, "±1%",   ""),
+        ("Total Market Rent",     our["total_mkt"],   ss.get("src_total_mkt"),      True,  False, False, "±0.5%", "Sum of all market rents"),
+        ("Occupied Market Rent",  our["occ_mkt"],     ss.get("src_occupied_mkt"),   True,  False, False, "±0.5%", ""),
+        ("Total Effective Rent",  our["eff_total"],   ss.get("src_rent_total"),     True,  False, False, "±2%",   "vs source rent charge total"),
+    ]
+
+    for ri, (metric, our_v, src_v, money, pct, exact, tol_label, note) in enumerate(checks, 3):
+        tol = 1.0 if pct else (2.0 if "Effective" in metric else 0.5)
+        lbl, bg, fg = vstatus(our_v, src_v, tol=tol, exact=exact)
+        diff = our_v - src_v if (src_v is not None and our_v is not None) else None
+        row_fill = PatternFill("solid", start_color="FFFFFF" if ri % 2 else "F8FAFC")
+        row_data = [metric, fmtv(src_v, money, pct), fmtv(our_v, money, pct),
+                    fmtv(diff, money, pct) if diff is not None else "—",
+                    lbl, tol_label, note]
+        for ci, val in enumerate(row_data, 1):
+            c = ws2.cell(row=ri, column=ci, value=val)
+            c.font = Font(name="Calibri", size=10,
+                          color=fg if ci == 5 else "1E293B", bold=(ci == 5))
+            c.fill = PatternFill("solid", start_color=bg) if ci == 5 else row_fill
+            c.alignment = Alignment(horizontal="right" if ci in (2, 3, 4) else
+                                    "center" if ci in (5, 6) else "left")
+            c.border = Border(bottom=Side(style="thin", color="E2E8F0"))
+
+    cc = ss.get("src_charge_codes", {})
+    if cc:
+        cc_start = len(checks) + 5
+        ws2.cell(row=cc_start, column=1,
+                 value="Charge Code Breakdown (from Source File)").font = Font(
+            name="Calibri", bold=True, size=10, color="0A2E3D")
+        ws2.cell(row=cc_start+1, column=1, value="Code").font = Font(name="Calibri", bold=True, size=9)
+        ws2.cell(row=cc_start+1, column=2, value="Amount").font= Font(name="Calibri", bold=True, size=9)
+        for j, (code, amt) in enumerate(sorted(cc.items(), key=lambda x: -abs(x[1])), cc_start+2):
+            is_r = code in RENT_CODES
+            ws2.cell(row=j, column=1, value=code).font  = Font(name="Calibri", size=9,
+                color="166534" if is_r else "374151", bold=is_r)
+            ws2.cell(row=j, column=2, value=f"${amt:,.0f}").font = Font(name="Calibri", size=9,
+                color="166534" if is_r else "374151")
+
+    note_r = len(checks) + len(cc) + 8
+    ws2.cell(row=note_r, column=1,
+             value="MATCH = within tolerance  |  OFF = slightly different  |  MISMATCH = significant gap  |  N/A = not in source").font = Font(
+        name="Calibri", size=8, italic=True, color="64748B")
+
+    for i, w in enumerate([26, 20, 20, 16, 18, 12, 38], 1):
+        ws2.column_dimensions[get_column_letter(i)].width = w
+    ws2.freeze_panes = "A3"
+
+    # Sheet 3: Raw File
     if raw_df is not None:
-        ws2 = wb.create_sheet(title="Raw File (Original)")
-        # Header row using column index as label
+        ws3 = wb.create_sheet(title="Raw File (Original)")
         hdr_fill = PatternFill("solid", start_color="1E3A4A")
-        for col_idx, col_val in enumerate(raw_df.columns, 1):
-            c = ws2.cell(row=1, column=col_idx, value=str(col_val))
+        for ci, col_val in enumerate(raw_df.columns, 1):
+            c = ws3.cell(row=1, column=ci, value=str(col_val))
             c.font = Font(name="Calibri", bold=True, color="FFFFFF", size=9)
-            c.fill = hdr_fill
-            c.alignment = Alignment(horizontal="center")
-        # Data rows
+            c.fill = hdr_fill; c.alignment = Alignment(horizontal="center")
         for ri, row in enumerate(raw_df.itertuples(index=False), 2):
-            row_fill = PatternFill("solid", start_color="FFFFFF" if ri%2==0 else "F8FAFC")
+            rf = PatternFill("solid", start_color="FFFFFF" if ri%2==0 else "F8FAFC")
             for ci, val in enumerate(row, 1):
-                cell_val = None if (isinstance(val, float) and pd.isna(val)) else val
-                c = ws2.cell(row=ri, column=ci, value=cell_val)
+                cv = None if (isinstance(val, float) and pd.isna(val)) else val
+                c = ws3.cell(row=ri, column=ci, value=cv)
                 c.font = Font(name="Calibri", size=9, color="374151")
-                c.fill = row_fill
-                c.alignment = Alignment(horizontal="left")
-        # Auto-width (cap at 30)
+                c.fill = rf; c.alignment = Alignment(horizontal="left")
         for ci in range(1, raw_df.shape[1]+1):
-            col_letter = get_column_letter(ci)
-            max_len = max(
-                (len(str(ws2.cell(row=r, column=ci).value or ""))
-                 for r in range(1, min(50, raw_df.shape[0]+2))),
-                default=8
-            )
-            ws2.column_dimensions[col_letter].width = min(max_len + 2, 30)
-        ws2.freeze_panes = "A2"
-        ws2.sheet_view.showGridLines = True
+            cl = get_column_letter(ci)
+            ml = max((len(str(ws3.cell(row=r, column=ci).value or ""))
+                      for r in range(1, min(50, raw_df.shape[0]+2))), default=8)
+            ws3.column_dimensions[cl].width = min(ml+2, 30)
+        ws3.freeze_panes = "A2"
 
-    buf=io.BytesIO(); wb.save(buf); buf.seek(0)
+    buf = io.BytesIO(); wb.save(buf); buf.seek(0)
     return buf.getvalue()
 
 
@@ -890,7 +1219,7 @@ st.markdown("""
     </div>
   </div>
   <div class="rv-hero-right">
-    <span class="rv-version">v5.2</span>
+    <span class="rv-version">v5.3</span>
     <div class="rv-badge">⚡ Claude AI</div>
   </div>
 </div>
@@ -965,6 +1294,9 @@ with main_tab:
             )
             time.sleep(0.4)
 
+            # Extract source summary BEFORE processing (scans raw file footer)
+            source_summary = extract_source_summary(original_df)
+
             # Build library context
             library_ctx = build_library_context()
 
@@ -979,6 +1311,9 @@ with main_tab:
                 st.stop()
 
             prog_ph.empty(); status_ph.empty()
+
+            # Extract source summary for verification
+            source_summary = extract_source_summary(original_df)
 
             # Auto-save to format library
             if broker_name.strip():
@@ -1001,6 +1336,27 @@ with main_tab:
             # Reconciliation
             st.markdown("<div class='sec-label'>Reconciliation Checks</div>", unsafe_allow_html=True)
             st.markdown(render_recon(standardized_df, len(original_df)), unsafe_allow_html=True)
+
+            # Source file verifier (only shown if summary block was found)
+            if source_summary:
+                st.markdown("<div class='sec-label'>Source File Verifier</div>", unsafe_allow_html=True)
+                st.markdown(render_source_verifier(standardized_df, source_summary), unsafe_allow_html=True)
+            else:
+                st.markdown("""<div style='font-size:0.75rem;color:rgba(255,255,255,0.3);
+                margin-bottom:1rem;'>ℹ No summary block detected in source file — verifier not available for this format.</div>""",
+                unsafe_allow_html=True)
+
+            # Source File Verifier — shown only when summary block was found
+            if source_summary:
+                st.markdown("<div class='sec-label'>Source File Verifier</div>", unsafe_allow_html=True)
+                st.markdown(render_source_verifier(standardized_df, source_summary), unsafe_allow_html=True)
+            else:
+                st.markdown("""
+                <div style='background:#0d1e2e;border:1px solid rgba(255,255,255,0.06);
+                border-radius:10px;padding:0.8rem 1.2rem;margin-bottom:1rem;
+                font-size:0.78rem;color:rgba(255,255,255,0.3);'>
+                ℹ️ No summary block detected in source file — verifier not available for this rent roll.
+                </div>""", unsafe_allow_html=True)
 
             # Side-by-side tabs
             st.markdown("<div class='sec-label'>Preview</div>", unsafe_allow_html=True)
