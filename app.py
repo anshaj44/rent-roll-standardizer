@@ -15,7 +15,8 @@ from openpyxl.utils import get_column_letter
 CLAUDE_MODEL   = "claude-haiku-4-5-20251001"
 OVERLAP_ROWS   = 8
 MAX_RETRIES    = 3
-PROMPT_VERSION = "v5.0"
+MAX_CONCURRENT = 3    # max parallel API connections — stays under rate limit
+PROMPT_VERSION = "v5.1"
 
 # Larger chunks = fewer API calls = lower cost
 def get_chunk_size(total_rows: int) -> int:
@@ -357,27 +358,37 @@ Data (chunk {chunk_num}/{total_chunks}):
 # ── ASYNC CLAUDE CALL (single chunk) ─────────────────────────────────────────
 async def call_claude_async(client: AsyncAnthropic, chunk_text: str,
                              chunk_num: int, total_chunks: int,
-                             analyst_hint: str, library_ctx: str) -> tuple[int, list]:
-    """Returns (chunk_num, rows) so results can be re-ordered after gather()."""
+                             analyst_hint: str, library_ctx: str,
+                             semaphore: asyncio.Semaphore) -> tuple[int, list]:
+    """Returns (chunk_num, rows). Semaphore caps concurrent connections."""
     prompt = build_prompt(chunk_text, chunk_num, total_chunks, analyst_hint, library_ctx)
     last_error = None
-    for attempt in range(MAX_RETRIES):
-        try:
-            resp = await client.messages.create(
-                model=CLAUDE_MODEL, max_tokens=4096,
-                messages=[{"role": "user", "content": prompt}]
-            )
-            raw = resp.content[0].text.strip()
-            raw = re.sub(r"^```(?:json)?\s*\n?", "", raw, flags=re.MULTILINE)
-            raw = re.sub(r"\n?```\s*$",           "", raw, flags=re.MULTILINE)
-            rows = json.loads(raw.strip())
-            return (chunk_num, rows)
-        except json.JSONDecodeError as e:
-            last_error = f"JSON error chunk {chunk_num} (attempt {attempt+1}): {e}"
-            await asyncio.sleep(1.5)
-        except Exception as e:
-            last_error = f"Error chunk {chunk_num} (attempt {attempt+1}): {e}"
-            await asyncio.sleep(1.5)
+
+    async with semaphore:  # only MAX_CONCURRENT chunks run at once
+        for attempt in range(MAX_RETRIES):
+            try:
+                resp = await client.messages.create(
+                    model=CLAUDE_MODEL, max_tokens=4096,
+                    messages=[{"role": "user", "content": prompt}]
+                )
+                raw = resp.content[0].text.strip()
+                raw = re.sub(r"^```(?:json)?\s*\n?", "", raw, flags=re.MULTILINE)
+                raw = re.sub(r"\n?```\s*$",           "", raw, flags=re.MULTILINE)
+                rows = json.loads(raw.strip())
+                return (chunk_num, rows)
+            except json.JSONDecodeError as e:
+                last_error = f"JSON error chunk {chunk_num} (attempt {attempt+1}): {e}"
+                await asyncio.sleep(2)
+            except Exception as e:
+                err_str = str(e)
+                # 429 rate limit — back off longer before retrying
+                if "429" in err_str or "rate_limit" in err_str:
+                    wait = 8 * (attempt + 1)   # 8s, 16s, 24s
+                    last_error = f"Rate limit on chunk {chunk_num} — waiting {wait}s (attempt {attempt+1}/{MAX_RETRIES})"
+                    await asyncio.sleep(wait)
+                else:
+                    last_error = f"Error chunk {chunk_num} (attempt {attempt+1}): {e}"
+                    await asyncio.sleep(2)
     raise RuntimeError(last_error)
 
 
@@ -413,17 +424,18 @@ def standardize_rent_roll(df, step_ph, prog_ph, status_ph, analyst_hint, library
     num_chunks = len(chunks)
     status_ph.markdown(
         f"<small style='color:rgba(255,255,255,0.4);'>"
-        f"Sending {num_chunks} chunk{'s' if num_chunks>1 else ''} in parallel · "
-        f"{total_rows} rows · chunk size {chunk_size}</small>",
+        f"Processing {num_chunks} chunk{'s' if num_chunks>1 else ''} "
+        f"({MAX_CONCURRENT} at a time) · {total_rows} rows · chunk size {chunk_size}</small>",
         unsafe_allow_html=True
     )
 
-    # ── Run all chunks concurrently ──
+    # ── Run chunks with controlled concurrency ──
     async def run_all():
         async_client = AsyncAnthropic(api_key=api_key)
+        sem = asyncio.Semaphore(MAX_CONCURRENT)
         tasks = [
             call_claude_async(async_client, csv_text, chunk_num, num_chunks,
-                              analyst_hint, library_ctx)
+                              analyst_hint, library_ctx, sem)
             for chunk_num, csv_text in chunks
         ]
         return await asyncio.gather(*tasks)
@@ -733,7 +745,7 @@ st.markdown("""
     </div>
   </div>
   <div class="rv-hero-right">
-    <span class="rv-version">v5.0</span>
+    <span class="rv-version">v5.1</span>
     <div class="rv-badge">⚡ Claude AI</div>
   </div>
 </div>
