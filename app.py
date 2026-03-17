@@ -308,8 +308,8 @@ def render_steps(active: int) -> str:
 
 
 # ── COMPACT PROMPT BUILDER ────────────────────────────────────────────────────
-# Kept terse deliberately — every token sent per chunk costs money.
-# Full rules fit in ~120 tokens vs the previous ~600-word version.
+# Rule 2 uses a whitelist approach: EffRent = ONLY rent + subsidy codes.
+# Everything else is EXCLUDED by default — no guessing on unknown charge codes.
 def build_prompt(chunk_text: str, chunk_num: int, total_chunks: int,
                  analyst_hint: str, library_ctx: str) -> str:
     hint = f"\nNOTE: {analyst_hint.strip()}" if analyst_hint.strip() else ""
@@ -319,7 +319,24 @@ Columns: Unit No | Unit Size (SF) | Market Rent (Monthly) | Effective Rent (Mont
 
 Rules:
 1. 1 row/unit — merge all charge sub-rows per unit.
-2. EffRent = base rent + rentsub/hap/subsidy ONLY. Exclude everything else (deposits, fees, utilities, discounts, etc).
+2. EffRent WHITELIST — include ONLY these charge codes in Effective Rent:
+   INCLUDE: rnt, rent, base, baserent, base rent, rentsub, sub, hap, subsidy, housing
+   EXCLUDE EVERYTHING ELSE by default. If a charge code is not on the INCLUDE list above,
+   do NOT add it to Effective Rent — regardless of what it looks like or what you think it means.
+   Common codes to EXCLUDE (not exhaustive — when in doubt, exclude):
+   con, conc, concession, concessions → rent concessions/discounts, EXCLUDE
+   cbl, cable, tv → cable/TV fees, EXCLUDE
+   pet, petfee, pet fee → pet fees, EXCLUDE
+   park, pkg, parkfee → parking, EXCLUDE
+   amen, amenity, amenityfee → amenity fees, EXCLUDE
+   trash, wtr, water, elec, electric, gas, util → utilities, EXCLUDE
+   dep, deposit, sec, secdep → deposits, EXCLUDE
+   late, latefee → late fees, EXCLUDE
+   admin, adminfee → admin fees, EXCLUDE
+   emp, empdisc, disc, discount → discounts, EXCLUDE
+   stor, storage → storage fees, EXCLUDE
+   ins, insurance, renters → insurance, EXCLUDE
+   Any unknown/unrecognized charge code → EXCLUDE
 3. Annual rent÷12. Rent/SF×SF=monthly.
 4. Dates→MM/DD/YYYY or null.
 5. VACANT: include, EffRent=null, Name="VACANT".
@@ -607,8 +624,11 @@ def render_recon(df: pd.DataFrame, orig_rows: int) -> str:
 
 
 # ── EXCEL EXPORT ──────────────────────────────────────────────────────────────
-def build_excel(df: pd.DataFrame) -> bytes:
-    wb=Workbook(); ws=wb.active; ws.title="Standardized Rent Roll"
+def build_excel(df: pd.DataFrame, raw_df: pd.DataFrame = None) -> bytes:
+    wb  = Workbook()
+
+    # ── Sheet 1: Standardized ──
+    ws  = wb.active; ws.title = "Standardized Rent Roll"
     navy="0A2E3D"; thin=Side(style="thin",color="E2E8F0")
     bdr=Border(left=thin,right=thin,top=thin,bottom=thin)
     COLS=["Unit No","Unit Size (SF)","Market Rent (Monthly)",
@@ -638,8 +658,6 @@ def build_excel(df: pd.DataFrame) -> bytes:
             elif col in(3,4): c.number_format="$#,##0.00"; c.alignment=Alignment(horizontal="right")
             elif col in(5,6): c.alignment=Alignment(horizontal="center")
             else:             c.alignment=Alignment(horizontal="left")
-        if is_flagged:
-            ws.cell(row=ri,column=7).comment = None
     last=len(df)+1; tot=last+1
     for col in range(1,8):
         c=ws.cell(row=tot,column=col)
@@ -655,7 +673,7 @@ def build_excel(df: pd.DataFrame) -> bytes:
         "• Yellow rows = Vacant units","• Green rows = Non-revenue (Admin/Model)",
         "• Orange rows = ⚠ Flagged for review (unusual effective rent or low confidence)",
         "• Effective Rent = base rent + housing subsidy only",
-        "• Deposits, utilities, discounts, fees excluded"]):
+        "• Concessions, cable, parking, utilities, fees all excluded from Effective Rent"]):
         c=ws.cell(row=nr2+i,column=1,value=note)
         c.font=Font(name="Calibri",bold=(i==0),size=9,
                     color=("166534" if "Green" in note else "92400E" if "Yellow" in note
@@ -663,6 +681,38 @@ def build_excel(df: pd.DataFrame) -> bytes:
     for i,w in enumerate([14,14,22,24,16,16,26],1):
         ws.column_dimensions[get_column_letter(i)].width=w
     ws.freeze_panes="A2"; ws.auto_filter.ref=f"A1:G{last}"
+
+    # ── Sheet 2: Raw File ──
+    if raw_df is not None:
+        ws2 = wb.create_sheet(title="Raw File (Original)")
+        # Header row using column index as label
+        hdr_fill = PatternFill("solid", start_color="1E3A4A")
+        for col_idx, col_val in enumerate(raw_df.columns, 1):
+            c = ws2.cell(row=1, column=col_idx, value=str(col_val))
+            c.font = Font(name="Calibri", bold=True, color="FFFFFF", size=9)
+            c.fill = hdr_fill
+            c.alignment = Alignment(horizontal="center")
+        # Data rows
+        for ri, row in enumerate(raw_df.itertuples(index=False), 2):
+            row_fill = PatternFill("solid", start_color="FFFFFF" if ri%2==0 else "F8FAFC")
+            for ci, val in enumerate(row, 1):
+                cell_val = None if (isinstance(val, float) and pd.isna(val)) else val
+                c = ws2.cell(row=ri, column=ci, value=cell_val)
+                c.font = Font(name="Calibri", size=9, color="374151")
+                c.fill = row_fill
+                c.alignment = Alignment(horizontal="left")
+        # Auto-width (cap at 30)
+        for ci in range(1, raw_df.shape[1]+1):
+            col_letter = get_column_letter(ci)
+            max_len = max(
+                (len(str(ws2.cell(row=r, column=ci).value or ""))
+                 for r in range(1, min(50, raw_df.shape[0]+2))),
+                default=8
+            )
+            ws2.column_dimensions[col_letter].width = min(max_len + 2, 30)
+        ws2.freeze_panes = "A2"
+        ws2.sheet_view.showGridLines = True
+
     buf=io.BytesIO(); wb.save(buf); buf.seek(0)
     return buf.getvalue()
 
@@ -810,7 +860,7 @@ with main_tab:
             with col_dl:
                 st.download_button(
                     label="⬇  Download Standardized Rent Roll",
-                    data=build_excel(standardized_df),
+                    data=build_excel(standardized_df, original_df),
                     file_name=f"{base_name}_standardized_{today}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
