@@ -16,7 +16,7 @@ CLAUDE_MODEL   = "claude-haiku-4-5-20251001"
 OVERLAP_ROWS   = 8
 MAX_RETRIES    = 3
 MAX_CONCURRENT = 3    # max parallel API connections — stays under rate limit
-PROMPT_VERSION = "v5.4"
+PROMPT_VERSION = "v5.5"
 
 # Larger chunks = fewer API calls = lower cost
 def get_chunk_size(total_rows: int) -> int:
@@ -277,7 +277,10 @@ def label_raw_df(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
 
     for i, row in enumerate(vals[:15]):
         texts = [str(v).lower().strip() for v in row if v is not None and str(v).strip().lower() != 'nan']
-        if any("unit" in t for t in texts) and any(t in ("charge","rent","market") for t in texts):
+        # Use substring matching — headers may be 'Charge Code', 'Market Rent', 'Bldg-Unit' etc.
+        has_unit   = any("unit" in t or "bldg" in t for t in texts)
+        has_charge = any(kw in t for t in texts for kw in ("charge", "rent", "market", "amount", "scheduled"))
+        if has_unit and has_charge:
             header_row = i
             break
 
@@ -291,8 +294,17 @@ def label_raw_df(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
         return "" if s.lower() == "nan" else s
 
     row_a = [clean(v) for v in vals[header_row]]
-    row_b = [clean(v) for v in vals[header_row + 1]] \
-            if header_row + 1 < len(vals) else [""] * len(row_a)
+
+    # Only use row_b if it looks like a real header continuation (mostly short words,
+    # not a section label like 'Property: X' or 'Unit Type: Y')
+    row_b_raw = [clean(v) for v in vals[header_row + 1]] \
+                if header_row + 1 < len(vals) else [""] * len(row_a)
+    non_empty_b = [v for v in row_b_raw if v]
+    is_real_continuation = (
+        len(non_empty_b) >= 2  # multiple header fragments in row B
+        and not any(":" in v or len(v) > 25 for v in non_empty_b)  # not a label like 'Property: X'
+    )
+    row_b = row_b_raw if is_real_continuation else [""] * len(row_a)
 
     # Combine two header rows, ignoring empty/nan parts
     combined = []
@@ -302,22 +314,35 @@ def label_raw_df(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
 
     # Canonical name map — keys must match combined (after lowercasing)
     name_map = {
-        "unit":                "Unit No",
-        "unit type":           "Unit Type",
-        "unit sq ft":          "Sq Ft",
-        "sq ft":               "Sq Ft",
-        "resident":            "Resident ID",
-        "name":                "Tenant Name",
-        "market rent":         "Market Rent",
-        "charge code":         "Charge Code",
-        "amount":              "Charge Amount",   # ← THE rent amount column
-        "resident deposit":    "Res Deposit",
-        "other deposit":       "Other Deposit",
-        "other deposits":      "Other Deposit",
-        "move in":             "Move In",
-        "lease expiration":    "Lease Expiration",
-        "move out":            "Move Out",
-        "balance":             "Balance",
+        # Yardi style (split two-row header)
+        "unit":                 "Unit No",
+        "unit type":            "Unit Type",
+        "unit sq ft":           "Sq Ft",
+        "sq ft":                "Sq Ft",
+        "resident":             "Resident ID",
+        "name":                 "Tenant Name",
+        "market rent":          "Market Rent",
+        "charge code":          "Charge Code",
+        "amount":               "Charge Amount",
+        "resident deposit":     "Res Deposit",
+        "other deposit":        "Other Deposit",
+        "other deposits":       "Other Deposit",
+        "move in":              "Move In",
+        "lease expiration":     "Lease Expiration",
+        "move out":             "Move Out",
+        "balance":              "Balance",
+        # AppFolio / Crystal Gardens style (single-row header)
+        "bldg-unit":            "Unit No",
+        "sqft":                 "Sq Ft",
+        "unit status":          "Unit Status",
+        "lease start":          "Lease Start",
+        "lease end":            "Lease End",
+        "expected move-out":    "Move Out",
+        "ledger":               "Ledger",
+        "actual charges":       "Actual Charges",
+        "scheduled charges":    "Charge Amount",   # ← eff rent in AppFolio format
+        "deposit held":         "Res Deposit",
+        "move-in":              "Move In",
     }
 
     clean_cols = []
@@ -340,14 +365,20 @@ def label_raw_df(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
         elif name == "Charge Amount":   col_map["charge_amount"] = i
         elif name == "Market Rent":     col_map["market_rent"]   = i
         elif name == "Res Deposit":     col_map["deposit"]       = i
-        elif name == "Move In":         col_map["move_in"]       = i
-        elif name == "Lease Expiration":col_map["lease_exp"]     = i
-        elif name == "Move Out":        col_map["move_out"]      = i
+        elif name == "Move In":          col_map["move_in"]       = i
+        elif name in ("Lease Expiration", "Lease Start"): col_map["lease_exp"] = i
+        elif name == "Move Out":         col_map["move_out"]      = i
+        elif name == "Unit Status":      col_map["unit_status"]   = i
 
-    # Drop header rows, assign clean column names
-    data_df = df.iloc[header_row + 2:].copy()
+    # Skip 2 rows for split-header formats (Yardi), 1 row for single-header (AppFolio)
+    rows_to_skip = 2 if is_real_continuation else 1
+    data_df = df.iloc[header_row + rows_to_skip:].copy()
     data_df.columns = clean_cols[:data_df.shape[1]]
     data_df = data_df.reset_index(drop=True)
+
+    # Drop entirely-empty trailing columns — reduces token waste on wide files (e.g. 52-col)
+    data_df = data_df.dropna(axis=1, how='all')
+
     return data_df, col_map
 
 
@@ -437,27 +468,37 @@ You MUST scan ALL rows for this unit before deciding EffRent.
 Rules:
 1. 1 row/unit — merge ALL charge sub-rows for the same unit. Scan every sub-row.
 2. EffRent WHITELIST — include ONLY these charge codes in Effective Rent:
-   INCLUDE: rnt, rent, base, baserent, base rent, rentsub, sub, hap, subsidy, housing
+   SHORT CODES:  rnt, rent, base, baserent, rentsub, sub, hap, subsidy, housing
+   FULL TEXT:    Rent, Base Rent, Subsidy Rent, HAP, Housing Assistance
    EXCLUDE EVERYTHING ELSE. When in doubt, exclude.
-   Common codes to EXCLUDE:
-   con, conc, concession → EXCLUDE | cbl, cable, tv → EXCLUDE
-   pet, petfee, petrent → EXCLUDE | park, pkg, parkfee, garage → EXCLUDE
-   amen, amenityfee → EXCLUDE | trash, wtr, water, elec, gas, util → EXCLUDE
-   dep, deposit, secdep → EXCLUDE | late, latefee → EXCLUDE
-   emp, empdisc, disc → EXCLUDE | stor, storage → EXCLUDE
-   xmgmt, xonetime, x → management adjustments, EXCLUDE
-   total, Total → NOT a charge code, skip this row entirely
-   Any unrecognized code → EXCLUDE
+   Common codes/descriptions to EXCLUDE:
+   pet, petfee, petrent, Monthly Pet Rent → EXCLUDE
+   park, pkg, parkfee, garage, Garage/Parking Premium → EXCLUDE
+   pest, Pest Control Fees Monthly → EXCLUDE
+   trash, Trash Fees → EXCLUDE
+   util, Utility Service Fee → EXCLUDE
+   water, wtr, Water/Sewer Reimbursement → EXCLUDE
+   con, conc, concession, Month to Month Fees → EXCLUDE
+   cbl, cable, tv → EXCLUDE
+   dep, deposit, secdep, Security Deposit, Deposit Held → EXCLUDE
+   late, latefee → EXCLUDE
+   emp, empdisc, disc → EXCLUDE
+   stor, storage → EXCLUDE
+   xmgmt, xonetime → EXCLUDE
+   Charge Total, total, Total → NOT a charge — skip row entirely
+   Any unrecognized code or description → EXCLUDE
 3. Annual rent÷12. Rent/SF×SF=monthly.
 4. Dates→MM/DD/YYYY or null.
-5. VACANT: include, EffRent=null, Name="VACANT".
-6. ADMIN/MODEL: include, EffRent=null, Name="ADMIN"/"MODEL".
-7. Exclude future leases (no active rent charge).
-8. Exclude headers, subtotals, footer rows, blank rows.
+5. VACANT: any unit where Unit Status contains 'Vacant', or Tenant Name is blank/VACANT,
+   or Charge Code is '-' or None with 0 scheduled charges → include, EffRent=null, Name="VACANT".
+6. ADMIN/MODEL/EXCLUDED: any unit with status 'Admin', 'Office', 'Model', 'Down Unit', 'Excluded'
+   → include, EffRent=null, Name="ADMIN" or "MODEL" as appropriate.
+7. Exclude future leases (no active rent charge, future move-in date).
+8. Exclude section headers (Unit Type:, Property:), subtotals, footer rows, blank rows.
 9. Duplicate unit# → keep first only.
 10. Round money to 2 decimals.
 11. Add "flag":true if uncertain about any row.
-Never skip a unit that has a unit number.{hint}
+Never skip a unit that has a unit number — include ALL 136 (or however many) units.{hint}
 {library_ctx}
 Return raw JSON array only — no fences, no text. Start with [ end with ].
 
@@ -466,8 +507,9 @@ Data (chunk {chunk_num}/{total_chunks}):
 
 
 # ── PYTHON RENT RECOVERY — safety net for Claude misses ──────────────────────
-RENT_CODES    = {"rnt","rent","base","baserent","base rent","rentsub","sub","hap","subsidy","housing"}
-SUBSIDY_CODES = {"rentsub","sub","hap","subsidy","housing"}
+RENT_CODES    = {"rnt","rent","base","baserent","base rent","rentsub","sub","hap","subsidy","housing",
+                 "subsidy rent"}  # AppFolio uses full text 'Subsidy Rent'
+SUBSIDY_CODES = {"rentsub","sub","hap","subsidy","housing","subsidy rent"}
 
 def recover_missing_rents(result_df: pd.DataFrame, raw_df: pd.DataFrame,
                           col_map: dict = None) -> pd.DataFrame:
@@ -913,10 +955,10 @@ def render_recon(df: pd.DataFrame, orig_rows: int) -> str:
 # ── SOURCE SUMMARY EXTRACTOR ──────────────────────────────────────────────────
 def extract_source_summary(raw_df: pd.DataFrame) -> dict | None:
     """
-    Scans the raw dataframe for the summary block that most Yardi/MRI/AppFolio
-    exports include at the bottom (total units, occupied, vacant, market rent, etc.)
-    Also extracts the charge code breakdown table.
-    Returns a dict of extracted values, or None if no summary found.
+    Scans the raw dataframe for the summary block at the bottom of the rent roll.
+    Handles two formats:
+      Yardi   — summary keywords in col0, unit counts in col10, market rent in col6
+      AppFolio — status labels in col0 with counts in col1; charge codes in col3, amounts in col4
     """
     if raw_df is None or raw_df.empty:
         return None
@@ -924,76 +966,145 @@ def extract_source_summary(raw_df: pd.DataFrame) -> dict | None:
     summary = {}
     vals    = raw_df.values
 
-    OCCUPIED_KW   = {"occupied units", "occupied"}
-    VACANT_KW     = {"total vacant units", "vacant units", "vacant"}
-    NONREV_KW     = {"total non rev units", "non rev units", "non-revenue", "admin/model", "model/admin"}
-    TOTALS_KW     = {"totals:", "totals", "grand total", "total"}
-    CHARGECODE_KW = {"summary of charges", "charge code", "summary of charges by charge code"}
+    # ── Keyword sets ──
+    OCCUPIED_KW    = {"occupied units", "total occupied units", "occupied"}
+    VACANT_KW      = {"total vacant units", "vacant units", "total vacant"}
+    NONREV_KW      = {"total non rev units", "non rev units", "non-revenue",
+                      "admin/model", "model/admin", "total excluded units", " total excluded units"}
+    TOTALS_KW      = {"totals:", "totals", "grand total", "total rentable units",
+                      " total units", "total units"}
+    CHARGECODE_KW  = {"summary of charges", "charge code", "summary of charges by charge code",
+                      "charge code summary"}
 
-    in_chargecode_section = False
+    in_chargecode_yardi   = False   # Yardi: col0=code, col3=amount
+    in_chargecode_appfolio= False   # AppFolio: col3=code, col4=amount
     charge_codes: dict[str, float] = {}
 
     def safe_float(v):
         try:
-            return float(str(v).replace(",","").replace("(","- ").replace(")","").strip())
+            return float(str(v).replace(",", "").replace("(", "-").replace(")", "").strip())
         except: return None
 
     def safe_int(v):
         try:
-            return int(float(str(v).replace(",","").strip()))
+            v2 = safe_float(v)
+            return int(v2) if v2 is not None else None
         except: return None
 
     for row in vals:
-        # Pad short rows
         row = list(row) + [None] * max(0, 14 - len(row))
         c0 = str(row[0]).strip().lower() if row[0] is not None else ""
+        c3 = str(row[3]).strip().lower() if row[3] is not None else ""
 
-        # Skip pure parenthetical / label rows
-        if c0.startswith("(") or c0 in ("", "nan", "charge code"):
+        # Skip blanks, parenthetical rows, pure header labels
+        if c0.startswith("(") or c0 in ("", "nan", "charge code", "description",
+                                         "ledger: resident", "property: crystal gardens"):
+            # Stop AppFolio CC section if c3 signals end ('resident total:' / 'total:')
+            if in_chargecode_appfolio and "total" in c3:
+                in_chargecode_appfolio = False
+                continue
+            # But still scan col3 for AppFolio charge code rows
+            if in_chargecode_appfolio and c3 and c3 not in ("", "nan", "charge code",
+                "property: crystal gardens", "ledger: resident", "resident total:",
+                "total:", "charge code"):
+                amt = safe_float(row[4])
+                if amt is not None:
+                    charge_codes[c3] = charge_codes.get(c3, 0) + amt
             continue
 
-        # Detect charge code section start
+        # ── Yardi charge code section (col0=code, col3=amount) ──
         if any(kw in c0 for kw in CHARGECODE_KW):
-            in_chargecode_section = True
+            in_chargecode_yardi    = True
+            in_chargecode_appfolio = False
             continue
 
-        if in_chargecode_section:
+        # ── AppFolio charge code section (col3=section header) ──
+        if any(kw in c3 for kw in CHARGECODE_KW):
+            in_chargecode_appfolio = True
+            in_chargecode_yardi    = False
+            continue
+
+        # Process Yardi charge code rows
+        if in_chargecode_yardi:
             code = c0
-            if code == "total":
-                in_chargecode_section = False
+            if code in ("total", "", "nan", "charge code"):
+                if code == "total": in_chargecode_yardi = False
                 continue
-            if code in ("", "nan"):
-                continue
-            # Amount is in col3 for Yardi charge code tables
             amt = safe_float(row[3])
             if amt is not None:
                 charge_codes[code] = amt
             continue
 
-        # ── Summary group rows ──
+        # Process AppFolio charge code rows (col3=code, col4=amount)
+        if in_chargecode_appfolio:
+            code = c3
+            if code in ("total:", "total", "resident total:", "", "nan"):
+                if "total" in code: in_chargecode_appfolio = False
+                continue
+            amt = safe_float(row[4])
+            if amt is not None and code not in ("charge code", "property: crystal gardens",
+                                                 "ledger: resident"):
+                charge_codes[code] = charge_codes.get(code, 0) + amt
+            continue
+
+        # ── Yardi summary rows (unit counts in col10, market rent in col6) ──
         if any(kw == c0 for kw in OCCUPIED_KW):
-            summary["src_occupied_units"] = safe_int(row[10])
-            v = safe_float(row[6])
-            if v: summary["src_occupied_mkt"] = v
+            v = safe_int(row[10]) or safe_int(row[1])   # Yardi=col10, AppFolio=col1
+            if v: summary["src_occupied_units"] = v
+            mv = safe_float(row[6])
+            if mv: summary["src_occupied_mkt"] = mv
 
         elif any(kw == c0 for kw in VACANT_KW):
-            summary["src_vacant_units"] = safe_int(row[10])
+            v = safe_int(row[10]) or safe_int(row[1])
+            if v: summary["src_vacant_units"] = v
 
         elif any(kw == c0 for kw in NONREV_KW):
-            summary["src_nonrev_units"] = safe_int(row[10])
+            v = safe_int(row[10]) or safe_int(row[1])
+            if v: summary["src_nonrev_units"] = v
 
         elif any(kw == c0 for kw in TOTALS_KW):
-            summary["src_total_units"]   = safe_int(row[10])
-            v = safe_float(row[6]);  
-            if v: summary["src_total_mkt"] = v
-            v = safe_float(row[11])
-            if v: summary["src_occ_pct"] = v
-            v = safe_float(row[7])
-            if v: summary["src_lease_charges"] = v
+            # Yardi: col10=units, col6=market, col11=occ_pct, col7=lease_charges
+            # AppFolio " Total Units": col1=total
+            v = safe_int(row[10]) or safe_int(row[1])
+            if v: summary["src_total_units"] = v
+            mv = safe_float(row[6])
+            if mv: summary["src_total_mkt"] = mv
+            pv = safe_float(row[11])
+            if pv: summary["src_occ_pct"] = pv
+            lv = safe_float(row[7])
+            if lv: summary["src_lease_charges"] = lv
+
+        # AppFolio status summary rows — col0=description, col1=count
+        elif c0 in ("occupied no notice", "notice unrented"):
+            v = safe_int(row[1])
+            if v:
+                summary["src_occupied_units"] = summary.get("src_occupied_units", 0) + v
+
+        elif c0 == "total occupied units":
+            v = safe_int(row[1])
+            if v: summary["src_occupied_units"] = v   # override accumulated
+
+        elif c0 in ("vacant rented not ready", "vacant unrented not ready"):
+            v = safe_int(row[1])
+            if v:
+                summary["src_vacant_units"] = summary.get("src_vacant_units", 0) + v
+
+        elif c0 == "total vacant units":
+            v = safe_int(row[1])
+            if v: summary["src_vacant_units"] = v
+
+        elif c0 in ("excluded - down unit", "excluded - admin/office unit",
+                    "excluded -down unit", "excluded -admin/office unit"):
+            v = safe_int(row[1])
+            if v:
+                summary["src_nonrev_units"] = summary.get("src_nonrev_units", 0) + v
+
+        elif c0 in ("total rentable units", " total units", "total units"):
+            v = safe_int(row[1])
+            if v: summary["src_total_units"] = v
 
     if charge_codes:
         summary["src_charge_codes"] = charge_codes
-        # src_rent_total = sum of ONLY the rent-family codes the source counted
         rent_total = sum(v for k, v in charge_codes.items() if k in RENT_CODES)
         if rent_total:
             summary["src_rent_total"] = rent_total
@@ -1389,7 +1500,7 @@ st.markdown("""
     </div>
   </div>
   <div class="rv-hero-right">
-    <span class="rv-version">v5.4</span>
+    <span class="rv-version">v5.5</span>
     <div class="rv-badge">⚡ Claude AI</div>
   </div>
 </div>
