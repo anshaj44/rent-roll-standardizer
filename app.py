@@ -13,16 +13,16 @@ from openpyxl.utils import get_column_letter
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 CLAUDE_MODEL   = "claude-haiku-4-5-20251001"
-OVERLAP_ROWS   = 8
-MAX_RETRIES    = 3
-MAX_CONCURRENT = 3    # max parallel API connections — stays under rate limit
-PROMPT_VERSION = "v5.5"
+OVERLAP_ROWS   = 5            # reduced from 8 — saves ~10% tokens per file
+MAX_RETRIES    = 4
+MAX_CONCURRENT = 3            # back to 3 — with longer backoff this is safe
+PROMPT_VERSION = "v5.6"
 
-# Larger chunks = fewer API calls = lower cost
+# Chunk sizing — smaller = more parallelism + less output truncation risk
 def get_chunk_size(total_rows: int) -> int:
-    if total_rows <= 60:  return total_rows   # genuinely small — send as one chunk
-    if total_rows > 800:  return 60            # large file — small chunks
-    return 80                                  # standard
+    if total_rows <= 50:  return total_rows   # tiny file — single chunk
+    if total_rows > 600:  return 50            # large file — keep output tight
+    return 70                                  # standard
 
 st.set_page_config(
     page_title="RealVal · Rent Roll Standardizer",
@@ -331,7 +331,7 @@ def label_raw_df(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
         "lease expiration":     "Lease Expiration",
         "move out":             "Move Out",
         "balance":              "Balance",
-        # AppFolio / Crystal Gardens style (single-row header)
+        # AppFolio / Crystal Gardens / Park Vista style (single-row header)
         "bldg-unit":            "Unit No",
         "sqft":                 "Sq Ft",
         "unit status":          "Unit Status",
@@ -343,6 +343,9 @@ def label_raw_df(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
         "scheduled charges":    "Charge Amount",   # ← eff rent in AppFolio format
         "deposit held":         "Res Deposit",
         "move-in":              "Move In",
+        # Sunbelt / Vesper style variants
+        "budgeted rent":        "Market Rent",      # ← Sunbelt uses Budgeted Rent
+        "resident":             "Tenant Name",      # ← Sunbelt has Resident as tenant name col
     }
 
     clean_cols = []
@@ -471,19 +474,24 @@ Rules:
    FULL TEXT:    Rent, Base Rent, Subsidy Rent, HAP, Housing Assistance
    EXCLUDE EVERYTHING ELSE. When in doubt, exclude.
    Common codes/descriptions to EXCLUDE:
-   pet, petfee, petrent, Monthly Pet Rent → EXCLUDE
-   park, pkg, parkfee, garage, Garage/Parking Premium → EXCLUDE
+   pet, petfee, petrent, Pet Rent, Pet Fees, Monthly Pet Rent → EXCLUDE
+   park, pkg, parkfee, garage, Garage/Parking Premium, Optional Resident Parking → EXCLUDE
    pest, Pest Control Fees Monthly → EXCLUDE
    trash, Trash Fees → EXCLUDE
-   util, Utility Service Fee → EXCLUDE
+   util, Utility Service Fee, Utility Administration Fees → EXCLUDE
    water, wtr, Water/Sewer Reimbursement → EXCLUDE
-   con, conc, concession, Month to Month Fees → EXCLUDE
+   elec, electric, Electric - Reimbursement → EXCLUDE
+   gas, Gas Reimbursement → EXCLUDE
+   con, conc, concession, Monthly Concession, Month to Month Fees → EXCLUDE
    cbl, cable, tv → EXCLUDE
    dep, deposit, secdep, Security Deposit, Deposit Held → EXCLUDE
    late, latefee → EXCLUDE
-   emp, empdisc, disc → EXCLUDE
+   emp, empdisc, emptaxed, disc → EXCLUDE
    stor, storage → EXCLUDE
    xmgmt, xonetime → EXCLUDE
+   wd, insurmp, AmenTech, amentech, amenityfee → EXCLUDE
+   Package Locker Fee, Guarantor Waiver Fee, Credit Reporting Svc Fee, Credit Reporting Fee Auto → EXCLUDE
+   Lost Rent Model Unit → EXCLUDE (this is a negative adjustment, not real rent)
    Charge Total, total, Total → NOT a charge — skip row entirely
    Any unrecognized code or description → EXCLUDE
 3. Annual rent÷12. Rent/SF×SF=monthly.
@@ -497,7 +505,7 @@ Rules:
 9. Duplicate unit# → keep first only.
 10. Round money to 2 decimals.
 11. Add "flag":true if uncertain about any row.
-Never skip a unit that has a unit number — include ALL 136 (or however many) units.{hint}
+Never skip a unit that has a unit number.{hint}
 {library_ctx}
 Return raw JSON array only — no fences, no text. Start with [ end with ].
 
@@ -628,7 +636,7 @@ async def call_claude_async(client: AsyncAnthropic, chunk_text: str,
                 err_str = str(e)
                 # 429 rate limit — back off longer before retrying
                 if "429" in err_str or "rate_limit" in err_str:
-                    wait = 8 * (attempt + 1)   # 8s, 16s, 24s
+                    wait = 15 * (attempt + 1)   # 15s, 30s, 45s, 60s
                     last_error = f"Rate limit on chunk {chunk_num} — waiting {wait}s (attempt {attempt+1}/{MAX_RETRIES})"
                     await asyncio.sleep(wait)
                 else:
@@ -1499,7 +1507,7 @@ st.markdown("""
     </div>
   </div>
   <div class="rv-hero-right">
-    <span class="rv-version">v5.5</span>
+    <span class="rv-version">v5.6</span>
     <div class="rv-badge">⚡ Claude AI</div>
   </div>
 </div>
