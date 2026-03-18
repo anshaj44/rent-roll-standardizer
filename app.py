@@ -442,8 +442,7 @@ def build_prompt(chunk_text: str, chunk_num: int, total_chunks: int,
         dep_col  = col_map.get("deposit",        8)
         col_lock = (
             f"\nCOLUMN LOCK (detected from this file's headers — do not override):\n"
-            f"  Charge Amount column = '{['Charge Amount'] + [f'col position {amt_col}'][0:1][0]}' "
-            f"(position {amt_col}) — THIS is where Effective Rent comes from\n"
+            f"  Charge Amount column = 'Charge Amount' (position {amt_col}) — THIS is where Effective Rent comes from\n"
             f"  Charge Code column   = position {code_col}\n"
             f"  Market Rent column   = position {mkt_col} — NEVER use as Effective Rent\n"
             f"  Deposit column       = position {dep_col} — NEVER use as Effective Rent\n"
