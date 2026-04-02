@@ -253,7 +253,10 @@ def detect_rent_roll_sheet(file_bytes: bytes) -> tuple[pd.DataFrame, str]:
             sample = pd.read_excel(io.BytesIO(file_bytes), sheet_name=name, header=None, nrows=20)
             text   = " ".join(str(v).lower() for v in sample.values.flatten() if pd.notna(v))
             score  = sum(text.count(s) for s in SIGNALS)
-            score += sample.shape[0] * 0.5
+            # Reward total row count heavily — a sheet with 1268 rows has all the charge
+            # sub-rows; a sheet with 275 rows is a condensed summary. We want the full sheet.
+            total_rows = pd.read_excel(io.BytesIO(file_bytes), sheet_name=name, header=None).shape[0]
+            score += total_rows * 0.1   # weight total rows, not just sample
             scores[name] = score
         except Exception:
             scores[name] = 0
