@@ -265,8 +265,8 @@ def detect_rent_roll_sheet(file_bytes: bytes) -> tuple[pd.DataFrame, str]:
     # These are Excel references that openpyxl can't always resolve.
     # Sub-rows that carry forward unit number via formulas should be treated as None.
     import re
-    formula_mask = df.applymap(
-        lambda v: bool(re.match(r'^=', str(v))) if v is not None and str(v).startswith('=') else False
+    formula_mask = df.map(
+        lambda v: bool(str(v).startswith('=')) if v is not None and not isinstance(v, (int, float)) else False
     )
     df = df.where(~formula_mask, other=None)
 
