@@ -20,9 +20,9 @@ PROMPT_VERSION = "v5.8"
 
 # Chunk sizing — smaller = more parallelism + less output truncation risk
 def get_chunk_size(total_rows: int) -> int:
-    if total_rows <= 50:  return total_rows   # tiny file — single chunk
-    if total_rows > 600:  return 50            # large file — keep output tight
-    return 70                                  # standard
+    if total_rows <= 40:  return total_rows   # tiny file — single chunk
+    if total_rows > 600:  return 40            # large file
+    return 50                                  # standard — keeps output well within token limit
 
 st.set_page_config(
     page_title="RealVal · Rent Roll Standardizer",
@@ -788,7 +788,7 @@ async def call_claude_async(client: AsyncAnthropic, chunk_text: str,
         for attempt in range(MAX_RETRIES):
             try:
                 resp = await client.messages.create(
-                    model=CLAUDE_MODEL, max_tokens=8192,
+                    model=CLAUDE_MODEL, max_tokens=16000,
                     messages=[{"role": "user", "content": prompt}]
                 )
                 raw = resp.content[0].text.strip()
