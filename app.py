@@ -488,8 +488,38 @@ def label_raw_df(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     if fmt == "onsite":
         data_df = preprocess_onsite(data_df)
 
-    # Drop entirely-empty trailing columns (reduces tokens on 52-col files)
+    # Drop entirely-empty columns (reduces tokens on 52-col sparse files)
     data_df = data_df.dropna(axis=1, how='all')
+
+    # ── Post-dropna fix: rescue Unit No if header/data are offset ──
+    # Some formats (Blair at Bitters) have the Unit header at col1 but actual unit
+    # numbers at col0. After dropna removes the all-None col1, col0 survives with
+    # unit numbers but no matching header → labelled 'col_0'. Detect and fix this.
+    if "Unit No" not in data_df.columns:
+        # Check if position 0 looks like unit numbers (short alphanumeric strings)
+        first_col = data_df.iloc[:, 0].dropna().astype(str)
+        first_col_vals = first_col[~first_col.str.startswith('=')].head(20)
+        unit_like = first_col_vals.str.match(r'^[\w\-\.]+$') & (first_col_vals.str.len() <= 12)
+        if unit_like.sum() >= 3:
+            # Rename this column to Unit No
+            old_name = data_df.columns[0]
+            data_df = data_df.rename(columns={old_name: "Unit No"})
+            col_map["unit"] = 0
+
+    # Rebuild col_map positions using final column names (post-dropna positions may differ)
+    for pos, name in enumerate(data_df.columns):
+        if name == "Unit No":            col_map["unit"]          = pos
+        elif name == "Charge Code":      col_map["charge_code"]   = pos
+        elif name == "Charge Amount":    col_map["charge_amount"] = pos
+        elif name == "Market Rent":      col_map["market_rent"]   = pos
+        elif name == "Res Deposit":      col_map["deposit"]       = pos
+        elif name == "Move In":          col_map["move_in"]       = pos
+        elif name == "Lease Expiration": col_map["lease_end"]     = pos
+        elif name == "Lease Start":      col_map["lease_start"]   = pos
+        elif name == "Lease End":        col_map["lease_end"]     = pos
+        elif name == "Unit Status":      col_map["unit_status"]   = pos
+        elif name == "Tenant Name":      col_map["tenant"]        = pos
+        elif name == "Unit Type":        col_map["unit_type"]     = pos
 
     return data_df, col_map
 
@@ -583,8 +613,12 @@ FORMAT_NOTES = {
         "Vacant units have status 'Vacant' and no Lease Rent value."
     ),
     "unknown": (
-        "FORMAT: Unknown. Use column names as labelled.\n"
-        "Effective Rent = Charge Amount column where Charge Code = rent/Rent.\n"
+        "FORMAT: Custom single-row header (possibly Blair/ResProp or similar).\n"
+        "Use column names as labelled. The first column with short alphanumeric values is Unit No.\n"
+        "Effective Rent = 'Charge Amount' column where Charge Code/Description = 'Rent: Resident' or similar rent description.\n"
+        "'Unit Type' column = the unit type/floorplan code — always populate this output field.\n"
+        "'Tenant Name' or 'Residents' column = the tenant name.\n"
+        "Sub-rows have col0=None and use the Ledger/Description/Amount columns.\n"
         "Never use Market Rent or Deposit columns as Effective Rent."
     ),
 }
@@ -1442,6 +1476,228 @@ def render_source_verifier(standardized_df: pd.DataFrame, src: dict) -> str:
     </div>"""
 
 
+def run_qa_checks(df: pd.DataFrame, raw_df: pd.DataFrame = None) -> list[dict]:
+    """
+    Runs 8 specific QA checks on the standardized output before download.
+    Returns a list of check result dicts:
+      { "label": str, "status": "pass"|"warn"|"fail", "detail": str }
+    """
+    checks = []
+    if df is None or df.empty:
+        return [{"label": "Output has data", "status": "fail", "detail": "No rows were produced."}]
+
+    data = df[df["Unit No"].notna() & (df["Unit No"].astype(str).str.strip() != "TOTALS / AVERAGES")].copy()
+    total = len(data)
+    if total == 0:
+        return [{"label": "Output has data", "status": "fail", "detail": "No unit rows found."}]
+
+    eff  = pd.to_numeric(data["Effective Rent (Monthly)"], errors="coerce")
+    mkt  = pd.to_numeric(data["Market Rent (Monthly)"],   errors="coerce")
+    NON_REV = {"VACANT", "ADMIN", "MODEL"}
+    occ_mask = (
+        data["Tenant Name"].notna()
+        & ~data["Tenant Name"].astype(str).str.strip().str.upper().isin(NON_REV)
+        & (data["Tenant Name"].astype(str).str.strip() != "")
+        & (data["Tenant Name"].astype(str).str.strip().str.lower() != "none")
+    )
+    occ_count = occ_mask.sum()
+
+    # ── Check 1: Unit count vs raw file ──
+    raw_unit_count = None
+    if raw_df is not None and not raw_df.empty:
+        # Count distinct non-header, non-total rows that look like unit numbers
+        import re
+        raw_units = set()
+        skip_vals = {"unit","total","resident","hap","current/notice/vacant residents",
+                     "future residents/applicants","","nan","none","totals:"}
+        for val in raw_df.iloc[:, 0].dropna().astype(str):
+            v = val.strip()
+            if v.lower() not in skip_vals and not v.lower().startswith("as of") \
+               and not v.lower().startswith("month") and not v.lower().startswith("summary") \
+               and not v.lower().startswith("charge") and len(v) <= 12:
+                try:
+                    int(v); raw_units.add(v)
+                except ValueError:
+                    if re.match(r'^[\w\-\.]+$', v) and len(v) >= 2:
+                        raw_units.add(v)
+        raw_unit_count = len(raw_units)
+
+    if raw_unit_count and raw_unit_count > 0:
+        diff = total - raw_unit_count
+        if diff == 0:
+            checks.append({"label": "Unit count matches source", "status": "pass",
+                           "detail": f"{total} units in output = {raw_unit_count} in source file."})
+        elif abs(diff) <= 2:
+            checks.append({"label": "Unit count", "status": "warn",
+                           "detail": f"Output has {total} units, source has ~{raw_unit_count}. Difference of {diff:+d} — may include/exclude header rows."})
+        else:
+            checks.append({"label": "Unit count mismatch", "status": "fail",
+                           "detail": f"Output has {total} units but source appears to have {raw_unit_count}. Difference: {diff:+d} units."})
+    else:
+        checks.append({"label": "Unit count", "status": "warn",
+                       "detail": f"{total} units in output. Could not auto-count source units."})
+
+    # ── Check 2: Effective Rent — occupied units with $0 or null ──
+    zero_eff  = occ_mask & ((eff == 0) | eff.isna())
+    zero_count = zero_eff.sum()
+    if zero_count == 0:
+        checks.append({"label": "No missing Effective Rents", "status": "pass",
+                       "detail": f"All {occ_count} occupied units have a non-zero Effective Rent."})
+    elif zero_count <= 3:
+        units = data.loc[zero_eff, "Unit No"].tolist()
+        checks.append({"label": f"{zero_count} Effective Rent(s) = $0 or blank", "status": "warn",
+                       "detail": f"Units: {', '.join(str(u) for u in units)}. Review these — may be subsidy-only or unrecognised charge code."})
+    else:
+        checks.append({"label": f"{zero_count} Effective Rents = $0 or blank", "status": "fail",
+                       "detail": f"{zero_count} occupied units have $0 or blank Effective Rent. Likely a charge code not in the whitelist."})
+
+    # ── Check 3: Tenant Name missing ──
+    missing_name = occ_mask & (
+        data["Tenant Name"].astype(str).str.strip().isin(["", "None", "nan", "VACANT"])
+    )
+    # Actually count units where name looks like a resident ID (starts with t + digits)
+    name_is_id = occ_mask & data["Tenant Name"].astype(str).str.match(r'^[tT]\d{5,}')
+    bad_name_count = missing_name.sum() + name_is_id.sum()
+    if bad_name_count == 0:
+        checks.append({"label": "Tenant Names populated", "status": "pass",
+                       "detail": f"All {occ_count} occupied units have a tenant name."})
+    else:
+        checks.append({"label": f"{bad_name_count} Tenant Name(s) missing or incorrect", "status": "fail",
+                       "detail": "Some units have blank names or a Resident ID (t-number) instead of name. "
+                                 "This indicates a column mapping error — Resident ID and Tenant Name columns may be swapped."})
+
+    # ── Check 4: Unit Type populated ──
+    if "Unit Type" in data.columns:
+        missing_type = data["Unit Type"].isna() | (data["Unit Type"].astype(str).str.strip().isin(["", "None", "nan"]))
+        missing_type_count = missing_type.sum()
+        pct = missing_type_count / total * 100
+        if missing_type_count == 0:
+            checks.append({"label": "Unit Types populated", "status": "pass",
+                           "detail": f"All {total} units have a Unit Type."})
+        elif pct < 10:
+            checks.append({"label": f"{missing_type_count} Unit Type(s) missing", "status": "warn",
+                           "detail": f"{missing_type_count} units ({pct:.0f}%) have no Unit Type — may be vacant/model units."})
+        else:
+            checks.append({"label": f"{missing_type_count} Unit Types missing ({pct:.0f}%)", "status": "fail",
+                           "detail": "More than 10% of units are missing Unit Type. "
+                                     "The Unit Type column may not be mapped correctly for this file format."})
+    else:
+        checks.append({"label": "Unit Type column absent", "status": "warn",
+                       "detail": "Unit Type was not returned by Claude for this file. Format may not have a floorplan column."})
+
+    # ── Check 5: Effective Rent vs Market Rent sanity ──
+    occ_eff = eff[occ_mask & eff.notna() & mkt.notna()]
+    occ_mkt = mkt[occ_mask & eff.notna() & mkt.notna()]
+    above_2x   = (occ_eff > occ_mkt * 2).sum()
+    eff_eq_mkt = (abs(occ_eff - occ_mkt) < 0.01).sum()
+    pct_eq     = eff_eq_mkt / max(len(occ_eff), 1) * 100
+    if above_2x > 0:
+        checks.append({"label": f"{above_2x} Effective Rent(s) > 2× Market Rent", "status": "fail",
+                       "detail": "These units likely have a wrong value — a fee or total may have been captured instead of rent."})
+    elif pct_eq > 50:
+        checks.append({"label": f"{eff_eq_mkt} units: Effective = Market Rent ({pct_eq:.0f}%)", "status": "warn",
+                       "detail": f"{pct_eq:.0f}% of occupied units have Effective Rent exactly equal to Market Rent. "
+                                  "This may mean the Market Rent fallback was used — verify the charge code was recognised."})
+    else:
+        checks.append({"label": "Effective vs Market Rent looks reasonable", "status": "pass",
+                       "detail": f"Avg Effective Rent ${occ_eff.mean():,.0f} vs Avg Market Rent ${occ_mkt.mean():,.0f}."})
+
+    # ── Check 6: Lease End Date populated ──
+    lease_end_col = "Lease End Date"
+    if lease_end_col in data.columns:
+        missing_lease = occ_mask & (data[lease_end_col].isna() | (data[lease_end_col].astype(str).str.strip().isin(["", "None", "nan", "NaT"])))
+        missing_lease_count = missing_lease.sum()
+        pct_missing = missing_lease_count / max(occ_count, 1) * 100
+        if pct_missing < 5:
+            checks.append({"label": "Lease End Dates populated", "status": "pass",
+                           "detail": f"{occ_count - missing_lease_count} of {occ_count} occupied units have a Lease End Date."})
+        elif pct_missing < 30:
+            checks.append({"label": f"{missing_lease_count} Lease End Dates missing", "status": "warn",
+                           "detail": f"{pct_missing:.0f}% of occupied units are missing a Lease End Date."})
+        else:
+            checks.append({"label": f"{missing_lease_count} Lease End Dates missing ({pct_missing:.0f}%)", "status": "fail",
+                           "detail": "Most occupied units are missing Lease End Date. "
+                                     "The Lease Expiration column may not be mapped correctly."})
+
+    # ── Check 7: Lease Start = Move-In (flag if >80% match) ──
+    if "Lease Start Date" in data.columns and "Move In Date" in data.columns:
+        both_present = occ_mask & data["Lease Start Date"].notna() & data["Move In Date"].notna() \
+                      & ~data["Lease Start Date"].astype(str).isin(["", "None", "nan", "NaT"]) \
+                      & ~data["Move In Date"].astype(str).isin(["", "None", "nan", "NaT"])
+        matching = (data.loc[both_present, "Lease Start Date"].astype(str) ==
+                    data.loc[both_present, "Move In Date"].astype(str)).sum()
+        both_count = both_present.sum()
+        pct_match = matching / max(both_count, 1) * 100
+        if pct_match > 80 and both_count > 5:
+            checks.append({"label": f"Lease Start = Move-In for {matching} units ({pct_match:.0f}%)", "status": "warn",
+                           "detail": "Lease Start Date matches Move-In Date for most units. "
+                                     "This file may not have a separate Lease Start column — the value may be copied from Move-In."})
+        else:
+            checks.append({"label": "Lease Start dates look correct", "status": "pass",
+                           "detail": f"Lease Start differs from Move-In for most units."})
+
+    # ── Check 8: Flagged rows ──
+    if "flag" in data.columns:
+        flagged = data["flag"].astype(bool).sum()
+        if flagged == 0:
+            checks.append({"label": "No flagged rows", "status": "pass",
+                           "detail": "Claude had high confidence on all rows."})
+        elif flagged <= 5:
+            checks.append({"label": f"{flagged} flagged row(s)", "status": "warn",
+                           "detail": f"{flagged} rows were flagged by Claude or auto-recovery. Review the orange rows."})
+        else:
+            checks.append({"label": f"{flagged} flagged rows", "status": "fail",
+                           "detail": f"{flagged} rows flagged — high error rate. Consider re-running with a format hint."})
+
+    return checks
+
+
+def render_qa_panel(checks: list[dict]) -> str:
+    """Renders the QA check panel as HTML."""
+    pass_count = sum(1 for c in checks if c["status"] == "pass")
+    warn_count = sum(1 for c in checks if c["status"] == "warn")
+    fail_count = sum(1 for c in checks if c["status"] == "fail")
+
+    if fail_count > 0:
+        overall_color = "#ef4444"
+        overall_label = f"⛔  {fail_count} Issue{'s' if fail_count > 1 else ''} Found — Review Before Downloading"
+    elif warn_count > 0:
+        overall_color = "#f59e0b"
+        overall_label = f"⚠  {warn_count} Warning{'s' if warn_count > 1 else ''} — Verify These Items"
+    else:
+        overall_color = "#10b981"
+        overall_label = "✅  All Checks Passed — Output Looks Good"
+
+    rows_html = ""
+    for c in checks:
+        if c["status"] == "pass":
+            icon, color, bg = "✅", "#10b981", "rgba(16,185,129,0.07)"
+        elif c["status"] == "warn":
+            icon, color, bg = "⚠", "#f59e0b", "rgba(245,158,11,0.07)"
+        else:
+            icon, color, bg = "⛔", "#ef4444", "rgba(239,68,68,0.07)"
+        rows_html += f"""
+        <div style='display:flex;gap:0.8rem;align-items:flex-start;padding:0.6rem 0.8rem;
+                    background:{bg};border-radius:7px;margin-bottom:0.35rem;'>
+          <div style='font-size:0.85rem;padding-top:0.05rem;'>{icon}</div>
+          <div>
+            <div style='font-size:0.82rem;font-weight:600;color:{color};'>{c["label"]}</div>
+            <div style='font-size:0.75rem;color:rgba(255,255,255,0.5);margin-top:0.15rem;'>{c["detail"]}</div>
+          </div>
+        </div>"""
+
+    return f"""
+    <div style='background:#0a1628;border:1.5px solid {overall_color}40;border-radius:12px;
+                padding:1.1rem 1.2rem;margin-bottom:1.2rem;'>
+      <div style='font-size:0.88rem;font-weight:700;color:{overall_color};
+                  margin-bottom:0.8rem;letter-spacing:0.01em;'>{overall_label}</div>
+      <div style='font-size:0.72rem;color:rgba(255,255,255,0.3);margin-bottom:0.7rem;'>
+        {pass_count} passed · {warn_count} warnings · {fail_count} failed
+      </div>
+      {rows_html}
+    </div>"""
+
+
 def build_excel(df: pd.DataFrame, raw_df: pd.DataFrame = None,
                 source_summary: dict = None) -> bytes:
     wb   = Workbook()
@@ -1857,6 +2113,11 @@ with main_tab:
                 st.markdown(render_raw_table(original_df, sheet_name), unsafe_allow_html=True)
             with tab_clean:
                 st.markdown(render_table(standardized_df), unsafe_allow_html=True)
+
+            # ── QA Verification Panel ──────────────────────────────────────────
+            st.markdown("<div class='sec-label'>Pre-Download Verification</div>", unsafe_allow_html=True)
+            qa_checks = run_qa_checks(standardized_df, original_df)
+            st.markdown(render_qa_panel(qa_checks), unsafe_allow_html=True)
 
             # Download
             st.markdown("<div class='sec-label'>Download</div>", unsafe_allow_html=True)
