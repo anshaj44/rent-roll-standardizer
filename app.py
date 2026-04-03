@@ -16,7 +16,7 @@ CLAUDE_MODEL   = "claude-haiku-4-5-20251001"
 OVERLAP_ROWS   = 5            # reduced from 8 — saves ~10% tokens per file
 MAX_RETRIES    = 4
 MAX_CONCURRENT = 3            # back to 3 — with longer backoff this is safe
-PROMPT_VERSION = "v5.8"
+PROMPT_VERSION = "v5.9"
 
 # Chunk sizing — smaller = more parallelism + less output truncation risk
 def get_chunk_size(total_rows: int) -> int:
@@ -401,44 +401,53 @@ def label_raw_df(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
         "unit type":            "Unit Type",
         "unit sq ft":           "Sq Ft",
         "sq ft":                "Sq Ft",
-        "resident":             "Resident ID",   # col3 = Resident ID, NOT tenant name
-        "name":                 "Tenant Name",   # col4 = actual Tenant Name
+        "sq. feet":             "Sq Ft",          # Blair/WAT variant
+        "sqft":                 "Sq Ft",
+        "resident":             "Resident ID",    # col3: Resident ID (t-number)
+        "name":                 "Tenant Name",    # col4: actual Tenant Name
+        "residents":            "Tenant Name",    # Blair format
         "market rent":          "Market Rent",
+        "market":               "Market Rent",    # WAT/AMC format
         "charge code":          "Charge Code",
         "amount":               "Charge Amount",
+        "charge amount":        "Charge Amount",  # WAT/AMC format
+        "description":          "Charge Code",    # Blair/WAT: Description = charge type
         "resident deposit":     "Res Deposit",
         "other deposit":        "Other Deposit",
         "other deposits":       "Other Deposit",
         "move in":              "Move In",
+        "move-in":              "Move In",
         "lease expiration":     "Lease Expiration",
-        "move out":             "Move Out",
-        "balance":              "Balance",
-        # AppFolio (single-row header)
-        "bldg-unit":            "Unit No",
-        "sqft":                 "Sq Ft",
-        "unit status":          "Unit Status",
         "lease start":          "Lease Start",
         "lease end":            "Lease End",
+        "move out":             "Move Out",
+        "balance":              "Balance",
+        "type":                 "Unit Type",      # Blair/WAT: 'Type' column
+        # AppFolio (single-row header)
+        "bldg-unit":            "Unit No",
+        "unit status":          "Unit Status",
         "expected move-out":    "Move Out",
         "ledger":               "Ledger",
         "actual charges":       "Actual Charges",
         "scheduled charges":    "Charge Amount",
         "deposit held":         "Res Deposit",
-        "move-in":              "Move In",
         # Vesper/Sunbelt variant
         "budgeted rent":        "Market Rent",
         # OneSite/RealPage format
-        "unit":                 "Unit No",        # '\nUnit' cleaned to 'Unit'
         "floorplan":            "Unit Type",
         "unit designation":     "Unit Designation",
         "unit/lease status":    "Unit Status",
-        "name":                 "Tenant Name",
         "move-in move-out":     "Move In",
-        "market + addl.":       "Market Rent",    # OneSite market rent column
-        "trans code":           "Charge Code",    # OneSite charge code column
-        "lease rent":           "Charge Amount",  # OneSite effective rent column
+        "market + addl.":       "Market Rent",
+        "trans code":           "Charge Code",
+        "lease rent":           "Charge Amount",
         "total billing":        "Total Billing",
         "dep on hand":          "Res Deposit",
+        # WAT/AMC format extras
+        "lease dates":          "Lease Dates",    # combined start+end — Claude will split
+        "notice":               "Notice",
+        "credit amount":        "Credit Amount",
+        "resident balance":     "Balance",
     }
 
     clean_cols = []
@@ -463,8 +472,9 @@ def label_raw_df(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
         elif name == "Market Rent":      col_map["market_rent"]   = i
         elif name == "Res Deposit":      col_map["deposit"]       = i
         elif name == "Move In":          col_map["move_in"]       = i
-        elif name in ("Lease Expiration", "Lease Start"): col_map["lease_exp"] = i
-        elif name == "Move Out":         col_map["move_out"]      = i
+        elif name == "Lease Expiration": col_map["lease_end"]     = i   # Yardi: col11 = Lease END
+        elif name == "Lease Start":      col_map["lease_start"]   = i   # AppFolio/WAT: explicit start
+        elif name == "Lease End":        col_map["lease_end"]     = i   # AppFolio: explicit end
         elif name == "Unit Status":      col_map["unit_status"]   = i
         elif name == "Tenant Name":      col_map["tenant"]        = i
 
@@ -535,17 +545,17 @@ def render_steps(active: int) -> str:
 FORMAT_NOTES = {
     "yardi": (
         "FORMAT: Yardi export. Split two-row header.\n"
-        "Unit header row columns: Unit No | Unit Type | Sq Ft | Resident ID | Tenant Name | Market Rent | Charge Code | Charge Amount | Res Deposit | Other Deposit | Move In | Lease Expiration | Move Out | Balance\n"
-        "IMPORTANT: col3 = Resident ID (e.g. t9142369) — this is NOT the tenant name.\n"
-        "col4 = Tenant Name — use this as the tenant name.\n"
-        "col5 = Market Rent — NEVER use as Effective Rent.\n"
-        "col6 = Charge Code (rent, trash, petfee, amenity, conrent, rmrnt etc.)\n"
-        "col7 = Charge Amount — THIS is the Effective Rent when Charge Code is a rent code.\n"
-        "col8 = Res Deposit — NEVER use as Effective Rent.\n"
-        "Rent codes: rent, rnt, base, baserent, conrent, rmrnt, subsidy, rentsub, hap.\n"
-        "conrent = contracted rent (Fieldcrest-style) — IS the effective rent.\n"
-        "concourt = court credit (always negative) — include, nets against conrent.\n"
-        "rmrnt = property-prefixed rent code — IS the effective rent.\n"
+        "After label_raw_df, columns are: Unit No | Unit Type | Sq Ft | Resident ID | Tenant Name | Market Rent | Charge Code | Charge Amount | Res Deposit | Other Deposit | Move In | Lease Expiration | Move Out | Balance\n"
+        "KEY FIELDS:\n"
+        "  'Tenant Name' column (position 4) = the actual tenant name (e.g. 'Claire Walker') — use this for the Tenant Name output field.\n"
+        "  'Resident ID' column (position 3) = internal ID like t0893290 — do NOT use as Tenant Name.\n"
+        "  'Market Rent' column (position 5) = listed rent — NEVER use as Effective Rent.\n"
+        "  'Charge Code' column (position 6) = the charge type (rent, rnta, amenity, etc.).\n"
+        "  'Charge Amount' column (position 7) = the dollar amount — THIS is Effective Rent when Charge Code is a rent code.\n"
+        "  'Lease Expiration' column (position 11) = the lease END date — use for 'Lease End Date' output field.\n"
+        "  There is NO separate Lease Start column — set 'Lease Start Date' = null unless the file has one.\n"
+        "  'Unit Type' column (position 1) = floorplan code — always populate the Unit Type output field.\n"
+        "Rent codes for this format: rent, rnt, rnta, base, baserent, conrent, rmrnt, subsidy, rentsub, hap.\n"
         "Subsidy-only units: EffRent = subsidy amount (do NOT fall back to Market Rent)."
     ),
     "appfolio": (
@@ -601,8 +611,10 @@ def build_prompt(chunk_text: str, chunk_num: int, total_chunks: int,
         col_lock = "COLUMN RULE: EffRent = 'Charge Amount' where Charge Code = rent. Never use Market Rent or Deposit."
 
     return f"""Multifamily rent roll standardizer. ({PROMPT_VERSION})
-Output: JSON array, 9 columns + optional flag field.
-Columns: Unit No | Unit Size (SF) | Market Rent (Monthly) | Effective Rent (Monthly) | Move In Date | Lease Start Date | Lease End Date | Move Out Date | Tenant Name
+Output: JSON array. Each object MUST have exactly these 9 fields:
+  "Unit No" | "Unit Size (SF)" | "Market Rent (Monthly)" | "Effective Rent (Monthly)" | "Move In Date" | "Lease Start Date" | "Lease End Date" | "Move Out Date" | "Tenant Name"
+Also include "Unit Type" (floorplan/type code from col1) and optional "flag" field.
+IMPORTANT: Output these field names EXACTLY as shown. Do not rename, reorder, or skip any.
 
 {format_note}
 {col_lock}
@@ -610,41 +622,44 @@ Columns: Unit No | Unit Size (SF) | Market Rent (Monthly) | Effective Rent (Mont
 Rules:
 1. 1 row/unit — merge ALL charge sub-rows for the same unit. Scan every sub-row.
 2. EffRent WHITELIST — include ONLY these charge codes in Effective Rent:
-   SHORT CODES (Yardi):  rnt, rent, base, baserent, rentsub, sub, hap, subsidy, housing
-   PROPERTY-PREFIXED:    conrent (contracted rent), rmrnt (property-prefixed rent) — these ARE rent
-   OFFSET CODES:         concourt (court credit, negative) — include, nets against conrent
-   FULL TEXT:            Rent, Base Rent, Subsidy Rent, HAP, Housing Assistance
+   SHORT CODES:  rnt, rent, rnta, base, baserent, rentsub, sub, hap, subsidy, housing
+   PROPERTY-PREFIXED: conrent, rmrnt, hudr (HUD Rent in AMC format)
+   OFFSET CODES: concourt (court credit, always negative — nets against conrent)
+   FULL TEXT:    Rent, Rent: Resident, Rent: HUD, Rent: HUD - SAHA, Rent: HUD - Bexar County,
+                 Base Rent, Subsidy Rent, HAP, Housing Assistance, RENT-Rent, HUDR-HUD Rent
    EXCLUDE EVERYTHING ELSE. When in doubt, exclude.
-   CRITICAL DISTINCTION: conrent ≠ con/conc. conrent IS rent. con/conc = concession → EXCLUDE.
+   CRITICAL: conrent ≠ con/conc. conrent IS rent. con/conc/conm = concession → EXCLUDE.
    Common codes/descriptions to EXCLUDE:
-   pet, petfee, petrent, rmpet, PETRENT, Pet Rent, Pet Fees, Monthly Pet Rent → EXCLUDE
-   park, pkg, parkfee, rmpkg, rmpki, rmpke, rmpkx, GARAGE, PARKING, Garage/Parking → EXCLUDE
-   pest, pestfee, conpest, Pest Control Fees Monthly → EXCLUDE
-   trash, VALETWASTE, Trash Fees → EXCLUDE
+   pet, petfee, petrent, petr, rmpet, PETRENT, Pet Rent, Pet Fees, Monthly Pet Rent → EXCLUDE
+   park, pkg, parkfee, rmpkg, rmpki, rmpke, GARAGE, PARKING, Garage/Parking → EXCLUDE
+   pest, pestfee, ubpest, conpest, Pest Control Fees Monthly → EXCLUDE
+   trash, VALETWASTE, Trash Fees, Utility- Trash → EXCLUDE
    util, conutil, Utility Service Fee, Utility Administration Fees → EXCLUDE
    water, wtr, Water/Sewer Reimbursement → EXCLUDE
    elec, electric, Electric - Reimbursement → EXCLUDE
-   gas, Gas Reimbursement → EXCLUDE
-   con, conc, concession, Monthly Concession, Month to Month Fees → EXCLUDE
+   gas, Gas Reimbursement, Utility Income - Gas/Fuel → EXCLUDE
+   con, conc, conm, conr, concession, Monthly Concession, Month To Month → EXCLUDE
    conrisk, condamw, conpetrt, conmtmf, conutil, conpest → EXCLUDE (con-prefix fees)
-   conemp, emp, empdisc, emptaxed, OFCRCRED → EXCLUDE (employee/officer discounts)
+   conemp, emp, empdisc, emptaxed, empm, OFCRCRED → EXCLUDE (employee/officer discounts)
    cbl, cable, tv → EXCLUDE
-   dep, deposit, secdep, Security Deposit, Deposit Held → EXCLUDE
+   dep, deposit, secdep, Security Deposit, Deposit Held, Waiver Deposit Fee → EXCLUDE
    late, latefee → EXCLUDE
    stor, storage, STORAGE → EXCLUDE
    xmgmt, xonetime → EXCLUDE
    wd, insurmp, rntins → EXCLUDE (insurance/damage fees)
-   amenity, amentech, AmenTech, amenityfee, rmamen, club → EXCLUDE
+   amenity, artl, amentech, AmenTech, amenityfee, rmamen, club → EXCLUDE
+   Amenity Fees, Facilities Fee → EXCLUDE
    mtmfee, mtm, conmtmf, MTOM, MTM Fee → EXCLUDE (month-to-month fees)
    short, Short Term Fee → EXCLUDE
    rmcpk, rmcrp, rmcsx, rmptf → EXCLUDE (property-prefixed fees/adjustments)
-   Employee Discount → EXCLUDE (this is a negative charge — do NOT net it against rent)
+   Employee Discount → EXCLUDE (negative charge — do NOT net against rent)
    Package Locker Fee, Guarantor Waiver Fee, Credit Reporting Svc Fee → EXCLUDE
    BUILDINGFACILITIES, REFERRAL, MODEL, CONC/SPECL → EXCLUDE
-   Lost Rent Model Unit → EXCLUDE
+   LTOR, LTOL, REAL, PACK, CLAI, MTOM, PETF, PETR, VAC → EXCLUDE (AMC format codes)
+   Lost Rent Model Unit, VAC-Vacancy Loss → EXCLUDE
+   Washer & Dryer Income, Utility Income → EXCLUDE
    Charge Total, Total → NOT a charge — skip row entirely
    Any unrecognized code or description → EXCLUDE
-   OUTPUT: Unit Type field = the unit type/floorplan from the raw file (col1 in Yardi, col1 in AppFolio).
 3. Annual rent÷12. Rent/SF×SF=monthly.
 4. Dates→MM/DD/YYYY or null.
 5. VACANT: any unit where Unit Status contains 'Vacant', or Tenant Name is blank/VACANT,
@@ -668,6 +683,8 @@ Data (chunk {chunk_num}/{total_chunks}):
 RENT_CODES    = {
     # Standard Yardi short codes
     "rnt", "rent", "base", "baserent", "base rent",
+    # Property-specific rent codes
+    "rnta",        # Iris Apartments rent code
     # Subsidy / HAP codes
     "rentsub", "sub", "hap", "subsidy", "housing", "subsidy rent",
     # Fieldcrest Walk consolidated-charge format
@@ -675,6 +692,9 @@ RENT_CODES    = {
     "concourt",    # court/eviction credit — always negative, offsets conrent to $0
     # The Jordan (4_RR) property-prefixed rent code
     "rmrnt",       # rm-prefixed rent code used by this specific Yardi config
+    # HUD/Section 8 full-text descriptions
+    "rent: resident", "rent: hud", "rent: hud - saha", "rent: hud - bexar county",
+    "hudr",        # HUD Rent code in WAT/AMC format
 }
 SUBSIDY_CODES = {"rentsub", "sub", "hap", "subsidy", "housing", "subsidy rent"}
 
@@ -820,11 +840,10 @@ def validate_rows(df: pd.DataFrame) -> pd.DataFrame:
     """
     Three-pass validation:
     Pass 1 — Flag outliers (EffRent > 2× market, or < $100).
-    Pass 2 — HARD RULE: Any occupied unit with null EffRent gets flagged for review.
-              We NO LONGER auto-fill Market Rent as fallback — subsidy-only units and
-              special charge-code units (conrent, rmrnt etc.) legitimately have EffRent
-              that differs from Market Rent. Stamping Market Rent was causing wrong values.
-              Instead: flag as 0 so the analyst knows to review it.
+    Pass 2 — HARD RULE: Any occupied unit with null EffRent after recovery gets Market Rent
+              as a flagged fallback. This is better than showing $0 — analyst sees a real number
+              and the orange flag tells them to verify. Pure subsidy / special-code units
+              should have been caught by recover_missing_rents before reaching here.
     Pass 3 — Ensure flag column is clean bool.
     """
     if "flag" not in df.columns:
@@ -845,14 +864,17 @@ def validate_rows(df: pd.DataFrame) -> pd.DataFrame:
     df.loc[occ & eff.notna() & mkt.notna() & (eff > mkt * 2), "flag"] = True
     df.loc[occ & eff.notna() & (eff < 100), "flag"] = True
 
-    # Pass 2 — flag occupied units with blank EffRent but DO NOT auto-fill Market Rent
-    # recover_missing_rents() already tried Python-level recovery from raw file.
-    # If still null here, mark as flagged with 0 so analyst can see and fix.
-    blank_eff     = eff.isna()
+    # Pass 2 — fallback for any occupied unit still missing EffRent after all recovery
+    blank_eff      = eff.isna()
     occupied_blank = occ & blank_eff
     if occupied_blank.any():
-        df.loc[occupied_blank, "Effective Rent (Monthly)"] = 0.0
-        df.loc[occupied_blank, "flag"] = True
+        for idx in df.index[occupied_blank]:
+            mkt_val = mkt.loc[idx]
+            if pd.notna(mkt_val) and mkt_val > 0:
+                df.at[idx, "Effective Rent (Monthly)"] = round(float(mkt_val), 2)
+            else:
+                df.at[idx, "Effective Rent (Monthly)"] = 0.0
+            df.at[idx, "flag"] = True   # always orange — analyst must verify
 
     return df
 
@@ -914,11 +936,16 @@ def standardize_rent_roll(df, step_ph, prog_ph, status_ph, analyst_hint, library
         return pd.DataFrame(), col_map
 
     result_df = pd.DataFrame(all_rows)
-    COLS = ["Unit No","Unit Type","Unit Size (SF)","Market Rent (Monthly)","Effective Rent (Monthly)",
+    # Core 9-column schema — this MUST match exactly what the prompt tells Claude to output.
+    # Adding/reordering here breaks Claude's JSON field→column mapping.
+    COLS = ["Unit No","Unit Size (SF)","Market Rent (Monthly)","Effective Rent (Monthly)",
             "Move In Date","Lease Start Date","Lease End Date","Move Out Date","Tenant Name"]
     for col in COLS:
         if col not in result_df.columns: result_df[col] = None
-    result_df = result_df[COLS + (["flag"] if "flag" in result_df.columns else [])]
+    # Unit Type: include if Claude returned it (bonus field), else add blank column at end
+    if "Unit Type" not in result_df.columns:
+        result_df["Unit Type"] = None
+    result_df = result_df[COLS + ["Unit Type"] + (["flag"] if "flag" in result_df.columns else [])]
 
     for dc in ["Move In Date","Lease Start Date","Lease End Date","Move Out Date"]:
         result_df[dc] = pd.to_datetime(result_df[dc], errors="coerce").dt.strftime("%m/%d/%Y")
@@ -938,8 +965,8 @@ def standardize_rent_roll(df, step_ph, prog_ph, status_ph, analyst_hint, library
 
 # ── COLOR-CODED TABLE ─────────────────────────────────────────────────────────
 def render_table(df: pd.DataFrame) -> str:
-    COLS = ["Unit No","Unit Type","Unit Size (SF)","Market Rent (Monthly)","Effective Rent (Monthly)",
-            "Move In Date","Lease Start Date","Lease End Date","Move Out Date","Tenant Name"]
+    COLS = ["Unit No","Unit Size (SF)","Market Rent (Monthly)","Effective Rent (Monthly)",
+            "Move In Date","Lease Start Date","Lease End Date","Move Out Date","Tenant Name","Unit Type"]
     hdr  = "".join(f"<th>{c}</th>" for c in COLS) + "<th>Status</th>"
     body = ""
     flag_col = "flag" in df.columns
@@ -1422,10 +1449,10 @@ def build_excel(df: pd.DataFrame, raw_df: pd.DataFrame = None,
     thin = Side(style="thin", color="E2E8F0")
     bdr  = Border(left=thin, right=thin, top=thin, bottom=thin)
 
-    COLS = ["Unit No","Unit Type","Unit Size (SF)","Market Rent (Monthly)","Effective Rent (Monthly)",
-            "Move In Date","Lease Start Date","Lease End Date","Move Out Date","Tenant Name"]
-    DATE_COLS  = {6, 7, 8, 9}   # Move In, Lease Start, Lease End, Move Out (shifted +1)
-    MONEY_COLS = {4, 5}          # Market Rent, Effective Rent (shifted +1)
+    COLS = ["Unit No","Unit Size (SF)","Market Rent (Monthly)","Effective Rent (Monthly)",
+            "Move In Date","Lease Start Date","Lease End Date","Move Out Date","Tenant Name","Unit Type"]
+    DATE_COLS  = {5, 6, 7, 8}   # Move In, Lease Start, Lease End, Move Out (1-based col index)
+    MONEY_COLS = {3, 4}          # Market Rent, Effective Rent
 
     # Sheet 1: Standardized
     ws = wb.active; ws.title = "Standardized Rent Roll"
@@ -1452,7 +1479,7 @@ def build_excel(df: pd.DataFrame, raw_df: pd.DataFrame = None,
             c = ws.cell(row=ri, column=col, value=val)
             c.border = bdr; c.fill = fill
             c.font = Font(name="Calibri", size=10, italic=(iv or nr), color=fc)
-            if col == 3:             c.number_format = "#,##0";     c.alignment = Alignment(horizontal="right")  # Sq Ft
+            if col == 2:             c.number_format = "#,##0";     c.alignment = Alignment(horizontal="right")  # Sq Ft
             elif col in MONEY_COLS:  c.number_format = "$#,##0.00"; c.alignment = Alignment(horizontal="right")
             elif col in DATE_COLS:   c.alignment = Alignment(horizontal="center")
             else:                    c.alignment = Alignment(horizontal="left")
@@ -1464,10 +1491,9 @@ def build_excel(df: pd.DataFrame, raw_df: pd.DataFrame = None,
         c.font = Font(name="Calibri", bold=True, color="FFFFFF", size=10)
         c.border = bdr; c.alignment = Alignment(horizontal="right")
     ws.cell(row=tot, column=1, value="TOTALS / AVERAGES").alignment = Alignment(horizontal="left")
-    # col2 = Unit Type — no formula
-    ws.cell(row=tot, column=3, value=f"=SUM(C2:C{last})").number_format = "#,##0"           # Sq Ft
-    ws.cell(row=tot, column=4, value=f"=AVERAGE(D2:D{last})").number_format = "$#,##0.00"   # Market Rent
-    ws.cell(row=tot, column=5, value=f'=AVERAGEIF(E2:E{last},"<>",E2:E{last})').number_format = "$#,##0.00"  # Eff Rent
+    ws.cell(row=tot, column=2, value=f"=SUM(B2:B{last})").number_format = "#,##0"           # Sq Ft
+    ws.cell(row=tot, column=3, value=f"=AVERAGE(C2:C{last})").number_format = "$#,##0.00"   # Market Rent
+    ws.cell(row=tot, column=4, value=f'=AVERAGEIF(D2:D{last},"<>",D2:D{last})').number_format = "$#,##0.00"  # Eff Rent
 
     nr2 = tot + 2
     for i, note in enumerate(["Notes:",
@@ -1481,7 +1507,7 @@ def build_excel(df: pd.DataFrame, raw_df: pd.DataFrame = None,
                             "92400E" if "Yellow" in note else
                             "854D0E" if "Orange" in note else "595959")
 
-    for i, w in enumerate([14, 16, 10, 22, 22, 14, 16, 16, 14, 28], 1):
+    for i, w in enumerate([14, 10, 20, 22, 14, 14, 14, 14, 28, 18], 1):
         ws.column_dimensions[get_column_letter(i)].width = w
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = f"A1:{get_column_letter(len(COLS))}{last}"
@@ -1673,7 +1699,7 @@ st.markdown("""
     </div>
   </div>
   <div class="rv-hero-right">
-    <span class="rv-version">v5.8</span>
+    <span class="rv-version">v5.9</span>
     <div class="rv-badge">⚡ Claude AI</div>
   </div>
 </div>
